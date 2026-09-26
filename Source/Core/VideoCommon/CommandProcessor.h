@@ -49,6 +49,8 @@ struct SCPFifoStruct
   std::atomic<u32> bFF_LoWatermark = 0;
   std::atomic<u32> bFF_HiWatermark = 0;
 
+  std::atomic<u32> CPRepositionCount = 0;
+
   void Init();
   void DoState(PointerWrap& p);
 };
@@ -171,7 +173,7 @@ public:
 
   void SetCPStatusFromGPU();
   void SetCPStatusFromCPU();
-  void GatherPipeBursted();
+  void GatherPipeBursted(u32 bursts);
   void UpdateInterrupts(u64 userdata);
   void UpdateInterruptsFromVideoBackend(u64 userdata);
 

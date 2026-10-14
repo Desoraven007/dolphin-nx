@@ -217,16 +217,16 @@ const std::vector<std::unique_ptr<VideoBackendBase>>& VideoBackendBase::GetAvail
     backends.push_back(std::make_unique<DX11::VideoBackend>());
     backends.push_back(std::make_unique<DX12::VideoBackend>());
 #endif
-#ifdef HAS_OPENGL
-    backends.push_back(std::make_unique<OGL::VideoBackend>());
-#endif
 #ifdef HAS_VULKAN
-#if defined(__APPLE__) || defined(__SWITCH__)
-    // Emplace the Vulkan backend at the beginning so it takes precedence over OpenGL.
-    // On macOS OpenGL is deprecated, while Switch keeps NVK as its established default.
-    backends.emplace(backends.begin(), std::make_unique<Vulkan::VideoBackend>());
-#else
     backends.push_back(std::make_unique<Vulkan::VideoBackend>());
+#endif
+#ifdef HAS_OPENGL
+#ifdef ANDROID
+    // Emplace the OpenGL backend at the beginning so it takes precedence over Vulkan.
+    // On Android, we prefer OpenGL over Vulkan due to OpenGL supporting more features.
+    backends.emplace(backends.begin(), std::make_unique<OGL::VideoBackend>());
+#else
+    backends.push_back(std::make_unique<OGL::VideoBackend>());
 #endif
 #endif
 #ifdef __APPLE__

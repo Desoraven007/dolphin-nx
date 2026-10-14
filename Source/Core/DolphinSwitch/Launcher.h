@@ -27,6 +27,9 @@ std::optional<LaunchRequest> RunLauncher(std::string startup_message = {},
 
 bool RunAppletInstaller(std::string launcher_path = {});
 
+bool LaunchEmbeddedRuntime(const std::string& launcher_path, const LaunchRequest& request,
+                           std::string* error);
+
 bool RecordInstalledReleaseTag(std::string_view tag);
 
 bool PrepareLaunchStorage(const std::string& path, std::string* resolved_path = nullptr);

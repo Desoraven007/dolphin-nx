@@ -9,6 +9,9 @@
 
 #include "Common/Assert.h"
 #include "Common/FileUtil.h"
+#ifdef __SWITCH__
+#include "Common/HorizonClocks.h"
+#endif
 #include "Common/MsgHandler.h"
 #include "Core/ConfigManager.h"
 
@@ -42,6 +45,9 @@ ShaderCache::~ShaderCache()
 
 bool ShaderCache::Initialize()
 {
+#ifdef __SWITCH__
+  Common::HorizonClocks::ScopedCpuBoost boost;
+#endif
   m_api_type = g_backend_info.api_type;
   m_host_config.bits = ShaderHostConfig::GetCurrent().bits;
 
@@ -56,6 +62,9 @@ bool ShaderCache::Initialize()
 
 void ShaderCache::InitializeShaderCache()
 {
+#ifdef __SWITCH__
+  Common::HorizonClocks::ScopedCpuBoost boost;
+#endif
   m_async_shader_compiler->ResizeWorkerThreads(g_ActiveConfig.GetShaderPrecompilerThreads());
 
   // Load shader and UID caches.
@@ -80,6 +89,9 @@ void ShaderCache::InitializeShaderCache()
 
 void ShaderCache::Reload()
 {
+#ifdef __SWITCH__
+  Common::HorizonClocks::ScopedCpuBoost boost;
+#endif
   WaitForAsyncCompiler();
   ClosePipelineUIDCache();
   ClearCaches();

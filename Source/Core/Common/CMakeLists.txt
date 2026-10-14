@@ -270,6 +270,8 @@ elseif(APPLE)
   )
 elseif(DOLPHIN_SWITCH)
   target_sources(common PRIVATE
+    HorizonClocks.cpp
+    HorizonClocks.h
     Logging/ConsoleListenerNix.cpp
     MemArenaSwitch.cpp
   )

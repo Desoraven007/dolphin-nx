@@ -65,7 +65,9 @@
 #include "DiscIO/Enums.h"
 #include "DolphinSwitch/CoverDownload.h"
 #include "DolphinSwitch/DolphinTools.h"
+#include "DolphinSwitch/EmbeddedRuntime.h"
 #include "DolphinSwitch/Forwarder.h"
+#include "DolphinSwitch/FrameGeneration.h"
 #include "DolphinSwitch/Localization.h"
 #include "DolphinSwitch/Storage.h"
 #include "DolphinSwitch/SystemLanguage.h"
@@ -74,7 +76,6 @@
 #include "InputCommon/ControllerInterface/Switch/Switch.h"
 #include "UICommon/GameFile.h"
 #include "UICommon/GameFileCache.h"
-#include "VideoBackends/Vulkan/LSFGControl.h"
 #include "VideoCommon/PostProcessing.h"
 #include "VideoCommon/VideoConfig.h"
 
@@ -1052,12 +1053,13 @@ static constexpr SettingHelpEntry SETTING_HELP[] = {
      "Signs in to RetroAchievements and controls achievement, hardcore-mode and progress "
      "notifications for supported game hashes."},
     {"Frame Generation", "Settings group",
-     "Configures Vulkan LSFG 2x frame generation. It inserts display frames but does not increase "
+     "Configures Vulkan and Deko3D LSFG 2x frame generation. It inserts display frames but does "
+     "not increase "
      "the emulated game's speed."},
     {"CPU / Emulation", "Settings group",
      "Contains Dolphin's CPU engine, threading, speed, MMU, cache and timing controls."},
     {"Graphics", "Settings group",
-     "Contains the Vulkan renderer, internal resolution, presentation, shader compilation, "
+     "Contains renderer selection, internal resolution, presentation, shader compilation, "
      "enhancements and graphics hacks."},
     {"Audio", "Settings group",
      "Controls DSP emulation, output volume and the buffers used to keep audio stable when frame "
@@ -1124,8 +1126,8 @@ static constexpr SettingHelpEntry SETTING_HELP[] = {
      "title-specific timing adjustment."},
 
     {"Video backend", "Graphics backend",
-     "Selects the Mesa graphics driver used for the next game. Vulkan (NVK) is the default; "
-     "OpenGL can use the native NVC0 driver or Zink over NVK, globally or per game."},
+     "Selects the renderer for the next game, globally or per game. Vulkan (NVK) is the default. "
+     "OpenGL offers NVC0 or Zink; Deko3D uses its own native renderer."},
     {"GLThread", "OpenGL command threading",
      "Lets Mesa build OpenGL command streams on a worker thread. It can improve CPU-limited "
      "games, but may reduce performance or expose compatibility issues in others. This setting "
@@ -1158,7 +1160,7 @@ static constexpr SettingHelpEntry SETTING_HELP[] = {
      "Opens graphics workarounds that trade accuracy for performance. Dolphin's defaults are "
      "recommended for most games."},
 
-    {"LSFG 2x (Vulkan only)", "Frame generation",
+    {"LSFG 2x (Vulkan / Deko3D)", "Frame generation",
      "Makes LSFG 2x available for the launch. It creates an intermediate display frame between "
      "rendered frames, adding smoothness without increasing emulation speed."},
     {"Flow resolution", "Frame generation quality",
@@ -1168,8 +1170,7 @@ static constexpr SettingHelpEntry SETTING_HELP[] = {
      "Uses LSFG's lighter performance-oriented path. Disable it only when testing quality with "
      "enough GPU headroom."},
     {"Lossless.dll", "Required component",
-     "Shows whether the LSFG runtime is installed in Dolphin's frame-generation folder. Frame "
-     "generation cannot start while it is missing."},
+     "Uses Lossless.dll from the lsfg folder for Vulkan and Deko3D frame generation."},
 
     {"Anti-aliasing", "Image quality / performance",
      "Smooths polygon edges. MSAA increases GPU and memory cost; SSAA is substantially more "
@@ -1758,6 +1759,8 @@ public:
   {
   }
   std::optional<LaunchRequest> Run();
+  bool LaunchEmbeddedRuntime(const std::string& launcher_path, const LaunchRequest& request,
+                             std::string* error);
   bool RunAppletInstaller();
   ~Launcher();
 
@@ -2009,7 +2012,8 @@ private:
   bool CopyTree(const std::string& source, const std::string& destination, TransferState* state);
   bool RenderTransfer(TransferState* state);
   void RunBusyTask(std::string_view title, std::string_view detail,
-                   const std::function<void()>& task, std::atomic_bool* cancel = nullptr);
+                   const std::function<void()>& task, std::atomic_bool* cancel = nullptr,
+                   const std::atomic<float>* progress = nullptr);
   bool ExecutePaste(const std::string& folder);
   bool RenamePath(const std::string& path);
   void FileActions(const std::string& path);
@@ -8005,8 +8009,13 @@ void Launcher::AdvancedEmulationSettings(bool per_game, Game* game)
 
 void Launcher::GraphicsSettings(bool per_game, Game* game)
 {
+#if defined(HAS_DEKO3D) || defined(DOLPHIN_SWITCH_EMBEDDED_DEKO3D)
+  static constexpr std::array<std::string_view, 4> BACKEND_LABELS = {
+      "Vulkan (NVK)", "OpenGL (NVC0)", "OpenGL (Zink/NVK)", "Deko3D"};
+#else
   static constexpr std::array<std::string_view, 3> BACKEND_LABELS = {
       "Vulkan (NVK)", "OpenGL (NVC0)", "OpenGL (Zink/NVK)"};
+#endif
   static constexpr std::array<std::string_view, 5> RESOLUTION_LABELS = {
       "Auto (integral)", "1x native", "2x", "3x", "4x"};
   static constexpr std::array<int, 5> RESOLUTION_VALUES = {0, 1, 2, 3, 4};
@@ -8024,7 +8033,11 @@ void Launcher::GraphicsSettings(bool per_game, Game* game)
     return normalized == "true" || normalized == "1" || normalized == "yes";
   };
   const auto backend_index = [](std::string_view value, bool use_zink) {
+#if defined(HAS_DEKO3D) || defined(DOLPHIN_SWITCH_EMBEDDED_DEKO3D)
+    return value == "Deko3D" ? 3 : value == "OGL" ? (use_zink ? 2 : 1) : 0;
+#else
     return value == "OGL" ? (use_zink ? 2 : 1) : 0;
+#endif
   };
   const auto global_backend_index = [&] {
     return backend_index(Config::Get(Config::MAIN_GFX_BACKEND),
@@ -8039,7 +8052,10 @@ void Launcher::GraphicsSettings(bool per_game, Game* game)
         bool_value(local_zink, Config::Get(Config::GFX_SWITCH_USE_ZINK));
     return backend_index(backend, use_zink);
   };
-  const auto show_glthread = [&] { return effective_backend_index() != 0; };
+  const auto show_glthread = [&] {
+    const int backend = effective_backend_index();
+    return backend == 1 || backend == 2;
+  };
   const auto backend_display = [&] {
     const bool has_local = get("Core", "GFXBackend").has_value() ||
                            get("Video_Settings", "SwitchUseZink").has_value();
@@ -8176,18 +8192,20 @@ void Launcher::GraphicsSettings(bool per_game, Game* game)
             else
             {
               selected = choice - 1;
-              SetGameSettings(
-                  *game,
-                  {{"Core", "GFXBackend", std::string(selected == 0 ? "Vulkan" : "OGL")},
-                   {"Video_Settings", "SwitchUseZink",
-                    std::string(selected == 2 ? "True" : "False")}});
+              SetGameSettings(*game, {{"Core", "GFXBackend",
+                                       std::string(selected == 3 ? "Deko3D" :
+                                                   selected == 0 ? "Vulkan" :
+                                                                   "OGL")},
+                                      {"Video_Settings", "SwitchUseZink",
+                                       std::string(selected == 2 ? "True" : "False")}});
             }
           }
           else
           {
             selected = SelectChoice("Video backend", BACKEND_LABELS, selected, delta);
-            Config::SetBase(Config::MAIN_GFX_BACKEND,
-                            std::string(selected == 0 ? "Vulkan" : "OGL"));
+            Config::SetBase(Config::MAIN_GFX_BACKEND, std::string(selected == 3 ? "Deko3D" :
+                                                                  selected == 0 ? "Vulkan" :
+                                                                                  "OGL"));
             Config::SetBase(Config::GFX_SWITCH_USE_ZINK, selected == 2);
             MarkConfigDirty();
           }
@@ -8386,25 +8404,31 @@ void Launcher::FrameGenerationSettings(bool per_game, Game* game)
   RunRows(
       per_game ? "Game frame generation" : "Frame Generation", game ? game->title : std::string{},
       [&] {
-        const bool installed = Vulkan::LSFG::IsDllInstalled();
+        const bool installed = DolphinSwitch::FrameGeneration::IsDllInstalled();
+        const bool prepared = DolphinSwitch::FrameGeneration::AreDekoShadersPrepared();
+        const std::string backend = per_game && game ?
+                                        GetGameSetting(*game, "Core", "GFXBackend")
+                                            .value_or(Config::Get(Config::MAIN_GFX_BACKEND)) :
+                                        Config::Get(Config::MAIN_GFX_BACKEND);
+        const bool ready = installed || (backend == "Deko3D" && prepared);
         const bool enabled = effective_enabled();
         const float flow = effective_flow();
         const bool performance = effective_performance();
         return std::vector<Row>{
-            {"LSFG 2x (Vulkan only)",
+            {"LSFG 2x (Vulkan / Deko3D)",
              per_game ? PerGameBoolLabel(*game, "Video_Settings", "LSFGEnabled",
                                          Config::Get(Config::GFX_LSFG_ENABLED)) :
                         std::string(enabled ? "On" : "Off"),
-             installed || enabled},
+             ready || enabled},
             {"Flow resolution",
              per_game && !local("LSFGFlowScale") ? GlobalValueLabel(flow_label(flow)) :
                                                    flow_label(flow),
-             installed && enabled},
+             ready && enabled},
             {"Performance mode",
              per_game ? PerGameBoolLabel(*game, "Video_Settings", "LSFGPerformanceMode",
                                          Config::Get(Config::GFX_LSFG_PERFORMANCE_MODE)) :
                         std::string(performance ? "On" : "Off"),
-             installed && enabled},
+             ready && enabled},
             {"Lossless.dll", installed ? "Installed" : "Missing", false, false, false, true, true,
              installed ? STATUS_OK_COLOR : STATUS_MISSING_COLOR},
         };
@@ -15204,7 +15228,8 @@ bool Launcher::RenderTransfer(TransferState* state)
 }
 
 void Launcher::RunBusyTask(std::string_view title, std::string_view detail,
-                           const std::function<void()>& task, std::atomic_bool* cancel)
+                           const std::function<void()>& task, std::atomic_bool* cancel,
+                           const std::atomic<float>* progress)
 {
   std::atomic<bool> complete{false};
   const std::string owned_title{title};
@@ -15249,11 +15274,18 @@ void Launcher::RunBusyTask(std::string_view title, std::string_view detail,
       const int panel_x = (m_width - panel_width) / 2;
       const int panel_y = (m_height - panel_height) / 2;
       GlassPanel(panel_x, panel_y, panel_width, panel_height);
-      const int phase = static_cast<int>((SDL_GetTicks() / 220) % 4);
-      std::string message(m_localization.Translate("Working"));
-      message.append(static_cast<std::size_t>(phase), '.');
-      DrawTextCentered(m_font_large, m_width / 2, panel_y + 44, message,
-                       m_value);
+      if (progress)
+      {
+        DrawProgressBar(panel_x + 40, panel_y + 52, panel_width - 80, 32,
+                        progress->load(std::memory_order_relaxed));
+      }
+      else
+      {
+        const int phase = static_cast<int>((SDL_GetTicks() / 220) % 4);
+        std::string message(m_localization.Translate("Working"));
+        message.append(static_cast<std::size_t>(phase), '.');
+        DrawTextCentered(m_font_large, m_width / 2, panel_y + 44, message, m_value);
+      }
       DrawTextCentered(
           m_font_small, m_width / 2, panel_y + 112,
           m_localization.Translate(cancel && cancel->load(std::memory_order_acquire) ?
@@ -18125,6 +18157,28 @@ std::optional<LaunchRequest> Launcher::Run()
 
 }  // namespace
 
+bool Launcher::LaunchEmbeddedRuntime(const std::string& launcher_path, const LaunchRequest& request,
+                                     std::string* error)
+{
+  if (!Initialize(true))
+  {
+    *error = "The Deko3D loading screen could not be initialized.";
+    return false;
+  }
+  bool launched = false;
+  std::atomic<float> progress{0.0f};
+  RunBusyTask(
+      "Loading Deko3D", {},
+      [&] {
+        launched = EmbeddedRuntime::Launch(launcher_path, request, error, [&](u64 done, u64 total) {
+          progress.store(total ? static_cast<float>(done) / total : 0.0f,
+                         std::memory_order_relaxed);
+        });
+      },
+      nullptr, &progress);
+  return launched;
+}
+
 std::optional<LaunchRequest> RunLauncher(std::string startup_message, std::string launcher_path)
 {
   std::optional<LaunchRequest> request;
@@ -18133,6 +18187,15 @@ std::optional<LaunchRequest> RunLauncher(std::string startup_message, std::strin
     request = launcher.Run();
   }
   return request;
+}
+
+bool LaunchEmbeddedRuntime(const std::string& launcher_path, const LaunchRequest& request,
+                           std::string* error)
+{
+  if (EmbeddedRuntime::IsCached())
+    return EmbeddedRuntime::Launch(launcher_path, request, error);
+  Launcher launcher({}, {});
+  return launcher.LaunchEmbeddedRuntime(launcher_path, request, error);
 }
 
 bool RunAppletInstaller(std::string launcher_path)

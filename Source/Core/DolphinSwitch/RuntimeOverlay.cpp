@@ -11,8 +11,8 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
-#include <deque>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -36,7 +36,7 @@
 #include "Core/GeckoCode.h"
 #include "Core/GeckoCodeConfig.h"
 #include "Core/State.h"
-#include "VideoBackends/Vulkan/LSFGControl.h"
+#include "DolphinSwitch/FrameGeneration.h"
 #include "VideoCommon/OnScreenUI.h"
 
 namespace DolphinSwitch::RuntimeOverlay
@@ -664,7 +664,7 @@ bool ItemAvailable(int index)
     return false;
   if (index == 7 && !s_is_wii)
     return false;
-  return index != 8 || Vulkan::LSFG::IsAvailable();
+  return index != 8 || DolphinSwitch::FrameGeneration::IsAvailable();
 }
 
 void HandleBack()
@@ -881,19 +881,19 @@ void RenderMainPage()
                 7);
   if (!s_is_wii)
     ImGui::PopStyleColor();
-  if (!Vulkan::LSFG::IsAvailable())
+  if (!DolphinSwitch::FrameGeneration::IsAvailable())
     ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(120, 145, 158, 255));
   SelectableRow(std::string("Frame Generation                 <  ") +
-                    (Vulkan::LSFG::IsAvailable() ?
-                         (Vulkan::LSFG::IsEnabled() ?
-                              (Vulkan::LSFG::IsHighFPSPassthrough() ?
+                    (DolphinSwitch::FrameGeneration::IsAvailable() ?
+                         (DolphinSwitch::FrameGeneration::IsEnabled() ?
+                              (DolphinSwitch::FrameGeneration::IsHighFPSPassthrough() ?
                                    "On (native FPS protected)" :
                                    "On") :
                               "Off") :
                          "Disabled") +
                     "  >",
                 8);
-  if (!Vulkan::LSFG::IsAvailable())
+  if (!DolphinSwitch::FrameGeneration::IsAvailable())
     ImGui::PopStyleColor();
   SelectableRow(std::string("Show FPS                         <  ") +
                     (s_show_fps ? "Enabled" : "Disabled") + "  >",
@@ -1355,17 +1355,17 @@ void ToggleFrameGenerationForSession()
   std::lock_guard lock{s_mutex};
   if (!s_initialized)
     return;
-  if (!Vulkan::LSFG::IsAvailable())
+  if (!DolphinSwitch::FrameGeneration::IsAvailable())
   {
-    s_status = Vulkan::LSFG::GetStatus();
+    s_status = DolphinSwitch::FrameGeneration::GetStatus();
     s_status_until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
     return;
   }
 
-  const bool enabled = !Vulkan::LSFG::IsEnabled();
-  if (!Vulkan::LSFG::RequestEnabled(enabled))
+  const bool enabled = !DolphinSwitch::FrameGeneration::IsEnabled();
+  if (!DolphinSwitch::FrameGeneration::RequestEnabled(enabled))
   {
-    s_status = Vulkan::LSFG::GetStatus();
+    s_status = DolphinSwitch::FrameGeneration::GetStatus();
     s_status_until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
     return;
   }

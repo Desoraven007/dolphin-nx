@@ -69,7 +69,11 @@ std::string GetDiskShaderCacheFileName(APIType api_type, const char* type, bool 
       filename += "OpenGL";
       break;
     case APIType::Vulkan:
+#ifdef HAS_DEKO3D
+      filename += "Deko3D";
+#else
       filename += "Vulkan";
+#endif
       break;
     default:
       break;

@@ -43,6 +43,7 @@ bash "${ROOT}/Tools/Switch/prepare_mesa_sdk.sh" "${MESA_SDK_ZIP}" \
 cmake -S "${ROOT}" -B "${BUILD_DIR}" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="${ROOT}/CMake/Toolchain-Switch.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DDOLPHIN_SWITCH_MESA_SDK_ROOT="${BUILD_DIR}/mesa-sdk" \
   -DDOLPHIN_SWITCH_NVK_OBJECT="${BUILD_DIR}/mesa-sdk/libvulkan_local.o" \
   -DDOLPHIN_SWITCH_RELEASE_VERSION="${RELEASE_VERSION}" \

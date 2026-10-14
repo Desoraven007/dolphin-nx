@@ -23,6 +23,7 @@
 
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
+#include "Common/HorizonClocks.h"
 #include "Common/MsgHandler.h"
 #include "Common/ScopeGuard.h"
 #include "Common/Thread.h"
@@ -47,6 +48,7 @@
 #include "Core/State.h"
 #include "Core/System.h"
 #include "DolphinSwitch/Audio.h"
+#include "DolphinSwitch/EmbeddedRuntime.h"
 #include "DolphinSwitch/Forwarder.h"
 #include "DolphinSwitch/GciSync.h"
 #include "DolphinSwitch/Launcher.h"
@@ -64,6 +66,9 @@
 #include "VideoCommon/Present.h"
 #include "VideoCommon/VideoBackendBase.h"
 #include "VideoCommon/VideoConfig.h"
+#ifdef HAS_DEKO3D
+#include "VideoBackends/Deko3D/DKFrameGenerationShaders.h"
+#endif
 
 extern "C" {
 u32 __nx_applet_type = AppletType_Application;
@@ -690,7 +695,8 @@ void UpdateSessionPauseState(Core::System& system, bool focused, bool user_pause
   }
 }
 
-SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request)
+SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request,
+                             const std::string& launcher_path)
 {
   Core::System& system = Core::System::GetInstance();
   DolphinSwitch::LaunchRequest resolved_request = request;
@@ -749,15 +755,63 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request)
 
   DolphinSwitch::GciSyncSession gci_sync;
   std::string gci_prepare_error;
-  if (!BootManager::BootCore(system, std::move(boot), wsi,
-                             [&] { return gci_sync.Prepare(system, &gci_prepare_error); }))
+  bool deko_handoff = false;
+  std::string handoff_error;
+  std::optional<Common::HorizonClocks::ScopedCpuBoost> boot_boost;
+  std::optional<std::uint64_t> frames_when_running;
+  const auto prepare_session = [&] {
+#ifdef DOLPHIN_SWITCH_DEKO3D_RUNTIME
+    boot_boost.emplace();
+    Config::SetCurrent(Config::MAIN_GFX_BACKEND, std::string("Deko3D"));
+    if (Config::Get(Config::GFX_LSFG_ENABLED) &&
+        Deko3D::FrameGeneration::GetShaderStatus() ==
+            Deko3D::FrameGeneration::ShaderStatus::NotPrepared)
+    {
+      consoleInit(nullptr);
+      std::printf("Loading Deko3D LSFG...\n\n");
+      consoleUpdate(nullptr);
+      handoff_error = Deko3D::FrameGeneration::PrepareShaders([](u32 compiled, u32 total) {
+        std::printf("\r%u%%", total ? compiled * 100 / total : 0);
+        consoleUpdate(nullptr);
+        if (!appletMainLoop())
+          s_applet_exit_requested.store(true, std::memory_order_release);
+      });
+      consoleExit(nullptr);
+      if (!handoff_error.empty() || s_applet_exit_requested.load(std::memory_order_acquire))
+        return false;
+      if (!ConfigureDefaultNWindow(window, width, height))
+      {
+        handoff_error = "Deko3D could not restore the display after loading LSFG.";
+        return false;
+      }
+    }
+#else
+    if (Config::Get(Config::MAIN_GFX_BACKEND) == "Deko3D")
+    {
+      Config::Save();
+      deko_handoff =
+          DolphinSwitch::LaunchEmbeddedRuntime(launcher_path, resolved_request, &handoff_error);
+      return false;
+    }
+    boot_boost.emplace();
+#endif
+    return gci_sync.Prepare(system, &gci_prepare_error);
+  };
+  if (!BootManager::BootCore(system, std::move(boot), wsi, prepare_session))
   {
+    if (deko_handoff)
+    {
+      s_session_running.store(false, std::memory_order_release);
+      return {true, {}};
+    }
     const bool attempted_vulkan = Config::Get(Config::MAIN_GFX_BACKEND) == "Vulkan";
     std::fprintf(stderr, "[Dolphin Switch] BootCore failed\n");
     s_session_running.store(false, std::memory_order_release);
     std::string cleanup_warning;
     gci_sync.Finish(&cleanup_warning);
-    std::string message = gci_prepare_error.empty() ?
+    std::string message = !handoff_error.empty() ?
+                              std::move(handoff_error) :
+                          gci_prepare_error.empty() ?
                               CollectAlertText("Dolphin failed to initialize the selected title.") :
                               std::move(gci_prepare_error);
     if (!cleanup_warning.empty())
@@ -822,6 +876,15 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request)
   while (s_session_running.load(std::memory_order_acquire) && (applet_alive = appletMainLoop()))
   {
     Core::HostDispatchJobs(system);
+
+    if (boot_boost && ever_running.load(std::memory_order_acquire))
+    {
+      const std::uint64_t frames = DolphinSwitch::RuntimeOverlay::GetRenderFrameGeneration();
+      if (!frames_when_running)
+        frames_when_running = frames;
+      else if (frames != *frames_when_running)
+        boot_boost.reset();
+    }
 
     for (PendingAlert& alert : TakePendingAlerts())
       DolphinSwitch::RuntimeOverlay::ShowAlert(std::move(alert.caption), std::move(alert.text));
@@ -978,6 +1041,13 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request)
     if (operation_mode_generation != handled_operation_mode_generation)
     {
       handled_operation_mode_generation = operation_mode_generation;
+#ifdef HAS_DEKO3D
+      const bool now_docked = appletGetOperationMode() == AppletOperationMode_Console;
+      const u32 new_width = now_docked ? 1920 : 1280;
+      const u32 new_height = now_docked ? 1080 : 720;
+      (void)nwindowSetDimensions(window, new_width, new_height);
+      (void)nwindowSetCrop(window, 0, 0, new_width, new_height);
+#endif
       if (g_presenter)
       {
         g_presenter->ResizeSurface();
@@ -996,6 +1066,7 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request)
 
   DolphinSwitch::RuntimeOverlay::EndSession();
   overlay_guard.Dismiss();
+  boot_boost.reset();
   Core::Stop(system);
   Core::Shutdown(system);
 
@@ -1034,10 +1105,32 @@ int main(int argc, char** argv)
     Common::SetCurrentThreadAffinity(2);
   }
 
+#ifdef DOLPHIN_SWITCH_DEKO3D_RUNTIME
+  bool has_runtime_argument = false;
+  for (int index = 1; index < argc; ++index)
+  {
+    has_runtime_argument |=
+        argv[index] && argv[index] == DolphinSwitch::EmbeddedRuntime::LAUNCH_ARGUMENT;
+  }
+  const auto runtime_request =
+      has_runtime_argument ? DolphinSwitch::EmbeddedRuntime::ReadRequest() : std::nullopt;
+  if (!runtime_request)
+  {
+    (void)DolphinSwitch::EmbeddedRuntime::ReturnToLauncher(
+        {}, "The Deko3D runtime must be launched from Dolphin.");
+    return EXIT_FAILURE;
+  }
+  const std::string launcher_path = runtime_request->launcher_path;
+#else
   const std::string launcher_path = DolphinSwitch::Updater::ResolveLauncherPath(self_path);
+#endif
   std::string update_recovery_error;
+#ifdef DOLPHIN_SWITCH_DEKO3D_RUNTIME
+  const bool update_recovery_ok = true;
+#else
   const bool update_recovery_ok =
       DolphinSwitch::Updater::RecoverInstallation(launcher_path, update_recovery_error);
+#endif
 
   const Result romfs_result = romfsInit();
   bool romfs_mounted = R_SUCCEEDED(romfs_result);
@@ -1050,7 +1143,13 @@ int main(int argc, char** argv)
       romfsExit();
   });
   if (!romfs_mounted)
+  {
+#ifdef DOLPHIN_SWITCH_DEKO3D_RUNTIME
+    (void)DolphinSwitch::EmbeddedRuntime::ReturnToLauncher(
+        launcher_path, "The Deko3D runtime's system data could not be mounted.");
+#endif
     return EXIT_FAILURE;
+  }
 
   File::SetSysDirectory("romfs:");
   UICommon::SetUserDirectory("sdmc:/switch/dolphin");
@@ -1060,10 +1159,18 @@ int main(int argc, char** argv)
   setenv("MESA_SWITCH_GLTHREAD", "0", 1);
   setenv("MESA_SWITCH_GL_DRIVER", "nvc0", 1);
   if (!self_path.empty())
-    DolphinSwitch::Forwarder::SetSelfPath(std::string(self_path));
+    DolphinSwitch::Forwarder::SetSelfPath(launcher_path);
 
   if (IsAppletMode())
+  {
+#ifdef DOLPHIN_SWITCH_DEKO3D_RUNTIME
+    (void)DolphinSwitch::EmbeddedRuntime::ReturnToLauncher(
+        launcher_path, "Deko3D requires launching Dolphin with full application memory.");
+    return EXIT_FAILURE;
+#else
     return DolphinSwitch::RunAppletInstaller() ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+  }
 
   sockets_initialized = R_SUCCEEDED(socketInitializeDefault());
   UICommon::Init();
@@ -1094,9 +1201,18 @@ int main(int argc, char** argv)
   Common::ScopeGuard overlay_renderer_guard(
       [] { DolphinSwitch::RuntimeOverlay::ShutdownRendererHook(); });
 
+#ifdef DOLPHIN_SWITCH_DEKO3D_RUNTIME
+  std::optional<DolphinSwitch::LaunchRequest> direct_request = runtime_request->game;
+#else
   std::optional<DolphinSwitch::LaunchRequest> direct_request = GetDirectLaunchRequest(argc, argv);
+#endif
   std::string launcher_message =
       update_recovery_ok ? std::string{} : "Update recovery failed: " + update_recovery_error;
+  for (int index = 1; index < argc; ++index)
+  {
+    if (argv[index] && argv[index] == DolphinSwitch::EmbeddedRuntime::RETURN_ARGUMENT)
+      launcher_message = DolphinSwitch::EmbeddedRuntime::ReadReturnMessage();
+  }
   while (!s_applet_exit_requested.load(std::memory_order_acquire))
   {
     std::optional<DolphinSwitch::LaunchRequest> request;
@@ -1107,8 +1223,12 @@ int main(int argc, char** argv)
     }
     else
     {
+#ifdef DOLPHIN_SWITCH_DEKO3D_RUNTIME
+      break;
+#else
       request = DolphinSwitch::RunLauncher(std::move(launcher_message), launcher_path);
       launcher_message.clear();
+#endif
     }
 
     if (!request)
@@ -1140,9 +1260,13 @@ int main(int argc, char** argv)
       break;
     }
 
-    const SessionResult result = RunGameSession(*request);
+    const SessionResult result = RunGameSession(*request, launcher_path);
     if (result.exit_application)
       break;
+#ifdef DOLPHIN_SWITCH_DEKO3D_RUNTIME
+    (void)DolphinSwitch::EmbeddedRuntime::ReturnToLauncher(launcher_path, result.launcher_message);
+    break;
+#endif
     if (result.restart_launcher)
     {
       (void)ScheduleLauncherRestart(launcher_path);

@@ -41,6 +41,9 @@
 #ifdef HAS_VULKAN
 #include "VideoBackends/Vulkan/VideoBackend.h"
 #endif
+#if defined(HAS_DEKO3D) || defined(DOLPHIN_SWITCH_EMBEDDED_DEKO3D)
+#include "VideoBackends/Deko3D/VideoBackend.h"
+#endif
 #ifdef __APPLE__
 #include "VideoBackends/Metal/VideoBackend.h"
 #endif
@@ -228,6 +231,11 @@ const std::vector<std::unique_ptr<VideoBackendBase>>& VideoBackendBase::GetAvail
 #endif
 #ifdef __APPLE__
     backends.emplace(backends.begin(), std::make_unique<Metal::VideoBackend>());
+#endif
+#ifdef HAS_DEKO3D
+    backends.emplace(backends.begin(), std::make_unique<Deko3D::VideoBackend>());
+#elif defined(DOLPHIN_SWITCH_EMBEDDED_DEKO3D)
+    backends.push_back(std::make_unique<Deko3D::VideoBackend>());
 #endif
 #ifndef __SWITCH__
 #ifdef HAS_OPENGL

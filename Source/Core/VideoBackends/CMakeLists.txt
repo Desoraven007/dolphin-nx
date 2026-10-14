@@ -18,3 +18,7 @@ endif()
 if(ENABLE_VULKAN)
   add_subdirectory(Vulkan)
 endif()
+
+if(DOLPHIN_SWITCH AND (ENABLE_DEKO3D OR DOLPHIN_SWITCH_BUNDLE_DEKO3D))
+  add_subdirectory(Deko3D)
+endif()

@@ -726,6 +726,10 @@ else()
   )
 endif()
 
+if(DOLPHIN_SWITCH AND (ENABLE_DEKO3D OR DOLPHIN_SWITCH_BUNDLE_DEKO3D))
+  target_link_libraries(core PUBLIC videodeko3d)
+endif()
+
 if(LIBUDEV_FOUND)
   target_include_directories(core PRIVATE ${LIBUDEV_INCLUDE_DIR})
   target_link_libraries(core PRIVATE ${LIBUDEV_LIBRARY})

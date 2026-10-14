@@ -44,10 +44,16 @@ namespace VideoCommon
 {
 static bool s_is_disabled = false;
 static std::atomic<ImGuiRenderCallback> s_imgui_render_callback{nullptr};
+static std::atomic<ImGuiRenderCallback> s_imgui_release_callback{nullptr};
 
 void SetImGuiRenderCallback(ImGuiRenderCallback callback)
 {
   s_imgui_render_callback.store(callback, std::memory_order_release);
+}
+
+void SetImGuiReleaseCallback(ImGuiRenderCallback callback)
+{
+  s_imgui_release_callback.store(callback, std::memory_order_release);
 }
 
 bool OnScreenUI::Initialize(u32 width, u32 height, float scale)
@@ -135,6 +141,8 @@ OnScreenUI::~OnScreenUI()
 #endif
   ImGui::DestroyContext();
   m_imgui_textures.clear();
+  if (const auto callback = s_imgui_release_callback.load(std::memory_order_acquire))
+    callback();
 }
 
 bool OnScreenUI::RecompileImGuiPipeline()

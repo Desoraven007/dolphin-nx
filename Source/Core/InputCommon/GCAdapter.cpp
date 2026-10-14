@@ -6,16 +6,22 @@
 #if defined(__SWITCH__)
 #define GCADAPTER_USE_LIBUSB_IMPLEMENTATION false
 #define GCADAPTER_USE_ANDROID_IMPLEMENTATION false
+#define GCADAPTER_USE_HORIZON_IMPLEMENTATION true
 #elif !defined(ANDROID)
 #define GCADAPTER_USE_LIBUSB_IMPLEMENTATION true
 #define GCADAPTER_USE_ANDROID_IMPLEMENTATION false
+#define GCADAPTER_USE_HORIZON_IMPLEMENTATION false
 #else
 #define GCADAPTER_USE_LIBUSB_IMPLEMENTATION false
 #define GCADAPTER_USE_ANDROID_IMPLEMENTATION true
+#define GCADAPTER_USE_HORIZON_IMPLEMENTATION false
 #endif
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <initializer_list>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -26,6 +32,8 @@ using namespace std::chrono_literals;
 #include <libusb.h>
 #elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
 #include <jni.h>
+#elif GCADAPTER_USE_HORIZON_IMPLEMENTATION
+#include <switch.h>
 #endif
 
 #include "Common/BitUtils.h"
@@ -48,6 +56,9 @@ using namespace std::chrono_literals;
 #include "Core/LibusbUtils.h"
 #elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
 #include "jni/AndroidCommon/IDCache.h"
+#elif GCADAPTER_USE_HORIZON_IMPLEMENTATION
+#include "Core/HW/GCPadEmu.h"
+#include "Core/Host.h"
 #endif
 
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
@@ -73,12 +84,10 @@ static void ResetRumbleLockNeeded();
 #endif
 
 static void Reset();
-#if GCADAPTER_USE_LIBUSB_IMPLEMENTATION || GCADAPTER_USE_ANDROID_IMPLEMENTATION
 static void Setup();
 static void ProcessInputPayload(const u8* data, std::size_t size);
 static void ReadThreadFunc();
 static void WriteThreadFunc();
-#endif
 
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
 enum class AdapterStatus
@@ -97,6 +106,8 @@ static jclass s_adapter_class;
 
 static bool s_detected = false;
 static int s_fd = 0;
+#elif GCADAPTER_USE_HORIZON_IMPLEMENTATION
+static std::atomic_bool s_detected = false;
 #endif
 
 enum class ControllerType : u8
@@ -137,7 +148,7 @@ static Common::Event s_write_happened;
 
 static std::mutex s_init_mutex;
 static std::mutex s_read_mutex;
-#if GCADAPTER_USE_ANDROID_IMPLEMENTATION
+#if GCADAPTER_USE_ANDROID_IMPLEMENTATION || GCADAPTER_USE_HORIZON_IMPLEMENTATION
 static std::mutex s_write_mutex;
 #endif
 
@@ -176,7 +187,76 @@ static std::array<std::atomic_bool, SerialInterface::MAX_SI_CHANNELS> s_config_r
 
 static std::atomic<double> s_adapter_poll_rate{};
 
-#if GCADAPTER_USE_LIBUSB_IMPLEMENTATION || GCADAPTER_USE_ANDROID_IMPLEMENTATION
+#if GCADAPTER_USE_HORIZON_IMPLEMENTATION
+static HidNpadIdType GetNpadId(int chan)
+{
+  return static_cast<HidNpadIdType>(HidNpadIdType_No1 + chan);
+}
+
+static u8 ToAdapterStick(s32 value, double gate_radius)
+{
+  const long raw = std::lround(GCPadStatus::MAIN_STICK_CENTER_X +
+                               value * gate_radius * GCPadStatus::MAIN_STICK_RADIUS / JOYSTICK_MAX);
+  return static_cast<u8>(std::clamp(raw, 0L, 255L));
+}
+
+static u8 ToAdapterTrigger(u32 value)
+{
+  return static_cast<u8>(std::min<u32>(value, 0x7fff) * 255 / 0x7fff);
+}
+
+static bool ReadHidPayload(std::array<u8, CONTROLLER_INPUT_PAYLOAD_EXPECTED_SIZE>& payload,
+                           std::array<u64, SerialInterface::MAX_SI_CHANNELS>& sampling_numbers)
+{
+  payload.fill(0);
+  payload[0] = 0x21;
+
+  bool sampled = false;
+  for (int chan = 0; chan < SerialInterface::MAX_SI_CHANNELS; ++chan)
+  {
+    const HidNpadIdType id = GetNpadId(chan);
+    if (!(hidGetNpadStyleSet(id) & HidNpadStyleTag_NpadGc))
+      continue;
+
+    HidNpadGcState state{};
+    if (hidGetNpadStatesGc(id, &state, 1) == 0 ||
+        !(state.attributes & HidNpadAttribute_IsConnected))
+      continue;
+
+    sampled |= state.sampling_number != sampling_numbers[chan];
+    sampling_numbers[chan] = state.sampling_number;
+
+    const auto bits = [&state](std::initializer_list<u64> masks) {
+      u8 result = 0;
+      u8 bit = 1;
+      for (const u64 mask : masks)
+      {
+        if (state.buttons & mask)
+          result |= bit;
+        bit <<= 1;
+      }
+      return result;
+    };
+
+    u8* const channel_data = &payload[1 + (9 * chan)];
+    channel_data[0] = 0x10;
+    channel_data[1] =
+        bits({HidNpadButton_A, HidNpadButton_B, HidNpadButton_X, HidNpadButton_Y,
+              HidNpadButton_Left, HidNpadButton_Right, HidNpadButton_Down, HidNpadButton_Up});
+    channel_data[2] =
+        bits({HidNpadButton_Plus, HidNpadButton_R, HidNpadButton_ZR, HidNpadButton_ZL});
+    channel_data[3] = ToAdapterStick(state.analog_stick_l.x, GCPad::MAIN_STICK_GATE_RADIUS);
+    channel_data[4] = ToAdapterStick(state.analog_stick_l.y, GCPad::MAIN_STICK_GATE_RADIUS);
+    channel_data[5] = ToAdapterStick(state.analog_stick_r.x, GCPad::C_STICK_GATE_RADIUS);
+    channel_data[6] = ToAdapterStick(state.analog_stick_r.y, GCPad::C_STICK_GATE_RADIUS);
+    channel_data[7] = ToAdapterTrigger(state.trigger_l);
+    channel_data[8] = ToAdapterTrigger(state.trigger_r);
+  }
+
+  return sampled;
+}
+#endif
+
 static void ReadThreadFunc()
 {
   Common::SetCurrentThreadName("GCAdapter Read Thread");
@@ -224,6 +304,11 @@ static void ReadThreadFunc()
   int poll_rate_measurement_count = 0;
 
   bool last_read_failed = false;
+
+#if GCADAPTER_USE_HORIZON_IMPLEMENTATION
+  std::array<u8, CONTROLLER_INPUT_PAYLOAD_EXPECTED_SIZE> last_payload{};
+  std::array<u64, SerialInterface::MAX_SI_CHANNELS> sampling_numbers{};
+#endif
 
   while (s_read_adapter_thread_running.IsSet() && !s_adapter_reads_failing.IsSet())
   {
@@ -277,6 +362,24 @@ static void ReadThreadFunc()
       first_read = false;
       s_fd = env->CallStaticIntMethod(s_adapter_class, getfd_func);
     }
+#elif GCADAPTER_USE_HORIZON_IMPLEMENTATION
+    if (!s_is_adapter_wanted.load(std::memory_order_relaxed))
+    {
+      Common::SleepCurrentThread(100);
+      continue;
+    }
+
+    std::array<u8, CONTROLLER_INPUT_PAYLOAD_EXPECTED_SIZE> input_buffer;
+    const bool sampled = ReadHidPayload(input_buffer, sampling_numbers);
+    if (sampled || input_buffer != last_payload)
+    {
+      ProcessInputPayload(input_buffer.data(), input_buffer.size());
+      last_payload = input_buffer;
+    }
+
+    Common::SleepCurrentThread(1);
+    if (!sampled)
+      continue;
 #endif
 
     // Update poll rate measurement.
@@ -322,6 +425,11 @@ static void WriteThreadFunc()
 #elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
   JNIEnv* const env = IDCache::GetEnvForThread();
   const jmethodID output_func = env->GetStaticMethodID(s_adapter_class, "output", "([B)I");
+#elif GCADAPTER_USE_HORIZON_IMPLEMENTATION
+  std::array<HidVibrationDeviceHandle, SerialInterface::MAX_SI_CHANNELS> vibration{};
+  std::array<bool, SerialInterface::MAX_SI_CHANNELS> vibration_ready{};
+  std::array<u8, SerialInterface::MAX_SI_CHANNELS> sent_rumble;
+  sent_rumble.fill(0xff);
 #endif
 
   while (s_write_adapter_thread_running.IsSet())
@@ -351,15 +459,47 @@ static void WriteThreadFunc()
 
       env->ReleaseByteArrayElements(jrumble_array, jrumble, 0);
       env->CallStaticIntMethod(s_adapter_class, output_func, jrumble_array);
+#elif GCADAPTER_USE_HORIZON_IMPLEMENTATION
+      std::array<u8, CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE> payload;
+      {
+        std::lock_guard lk(s_write_mutex);
+        payload = s_controller_write_payload;
+      }
+
+      for (int chan = 0; chan < SerialInterface::MAX_SI_CHANNELS; ++chan)
+      {
+        const u8 command = payload[1 + chan];
+        if (command == sent_rumble[chan] || command > HidVibrationGcErmCommand_StopHard)
+          continue;
+
+        if (!vibration_ready[chan])
+        {
+          vibration_ready[chan] = R_SUCCEEDED(hidInitializeVibrationDevices(
+              &vibration[chan], 1, GetNpadId(chan), HidNpadStyleTag_NpadGc));
+        }
+
+        if (vibration_ready[chan] &&
+            R_SUCCEEDED(hidSendVibrationGcErmCommand(
+                vibration[chan], static_cast<HidVibrationGcErmCommand>(command))))
+        {
+          sent_rumble[chan] = command;
+        }
+      }
 #endif
     }
 
     Common::YieldCPU();
   }
 
+#if GCADAPTER_USE_HORIZON_IMPLEMENTATION
+  for (int chan = 0; chan < SerialInterface::MAX_SI_CHANNELS; ++chan)
+  {
+    if (vibration_ready[chan])
+      hidSendVibrationGcErmCommand(vibration[chan], HidVibrationGcErmCommand_StopHard);
+  }
+#endif
   NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GCAdapter write thread stopped");
 }
-#endif
 
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
 #if LIBUSB_API_HAS_HOTPLUG
@@ -478,6 +618,17 @@ static void ScanThreadFunc()
 
     s_hotplug_event.Wait();
   }
+#elif GCADAPTER_USE_HORIZON_IMPLEMENTATION
+  while (s_adapter_detect_thread_running.IsSet())
+  {
+    if (!s_detected)
+    {
+      std::lock_guard lk(s_init_mutex);
+      Setup();
+    }
+
+    s_hotplug_event.Wait();
+  }
 #endif
 
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
@@ -552,6 +703,9 @@ void Init()
 #elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
   if (s_fd)
     return;
+#elif GCADAPTER_USE_HORIZON_IMPLEMENTATION
+  if (s_detected)
+    return;
 #endif
 
   auto& system = Core::System::GetInstance();
@@ -580,7 +734,6 @@ void Init()
   RefreshConfig();
 }
 
-#if GCADAPTER_USE_LIBUSB_IMPLEMENTATION || GCADAPTER_USE_ANDROID_IMPLEMENTATION
 static void Setup()
 {
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
@@ -608,8 +761,10 @@ static void Setup()
   if (s_status != AdapterStatus::Detected && prev_status != s_status &&
       s_detect_callback != nullptr)
     s_detect_callback();
-#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
+#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION || GCADAPTER_USE_HORIZON_IMPLEMENTATION
+#if GCADAPTER_USE_ANDROID_IMPLEMENTATION
   s_fd = 0;
+#endif
   s_detected = true;
 
   // Make sure the thread isn't in the middle of shutting down while starting a new one
@@ -620,7 +775,6 @@ static void Setup()
   s_read_adapter_thread = std::thread(ReadThreadFunc);
 #endif
 }
-#endif
 
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
 static bool CheckDeviceAccess(libusb_device* device)
@@ -803,7 +957,7 @@ static void Reset()
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
   if (s_status != AdapterStatus::Detected)
     return;
-#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
+#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION || GCADAPTER_USE_HORIZON_IMPLEMENTATION
   if (!s_detected)
     return;
 #endif
@@ -832,9 +986,11 @@ static void Reset()
   }
   if (s_detect_callback != nullptr)
     s_detect_callback();
-#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
+#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION || GCADAPTER_USE_HORIZON_IMPLEMENTATION
   s_detected = false;
+#if GCADAPTER_USE_ANDROID_IMPLEMENTATION
   s_fd = 0;
+#endif
 #endif
 
   NOTICE_LOG_FMT(CONTROLLERINTERFACE, "GC Adapter detached");
@@ -842,6 +998,10 @@ static void Reset()
 
 GCPadStatus Input(int chan)
 {
+#if GCADAPTER_USE_HORIZON_IMPLEMENTATION
+  if (Host_UIBlocksControllerState())
+    return {};
+#endif
   if (!s_is_adapter_wanted.load(std::memory_order_relaxed))
     return {};
 
@@ -850,6 +1010,9 @@ GCPadStatus Input(int chan)
     return {};
 #elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
   if (!s_detected || !s_fd)
+    return {};
+#elif GCADAPTER_USE_HORIZON_IMPLEMENTATION
+  if (!s_detected)
     return {};
 #endif
 
@@ -867,7 +1030,6 @@ GCPadStatus Input(int chan)
   return pad_state.status;
 }
 
-#if GCADAPTER_USE_LIBUSB_IMPLEMENTATION || GCADAPTER_USE_ANDROID_IMPLEMENTATION
 // Get ControllerType from first byte in input payload.
 static ControllerType IdentifyControllerType(u8 data)
 {
@@ -968,7 +1130,6 @@ void ProcessInputPayload(const u8* data, std::size_t size)
     }
   }
 }
-#endif
 
 bool DeviceConnected(int chan)
 {
@@ -989,10 +1150,11 @@ void ResetRumble()
   if (!lock.try_lock())
     return;
   ResetRumbleLockNeeded();
-#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
+#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION || GCADAPTER_USE_HORIZON_IMPLEMENTATION
   std::array<u8, CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE> rumble = {0x11, 0, 0, 0, 0};
   {
     std::lock_guard lk(s_write_mutex);
+    s_controller_rumble.fill(0);
     s_controller_write_payload = rumble;
     s_controller_write_payload_size.store(CONTROLLER_OUTPUT_RUMBLE_PAYLOAD_SIZE);
   }
@@ -1043,6 +1205,9 @@ void Output(int chan, u8 rumble_command)
 #elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
   if (!s_detected || !s_fd)
     return;
+#elif GCADAPTER_USE_HORIZON_IMPLEMENTATION
+  if (!s_detected)
+    return;
 #endif
 
   // Skip over rumble commands if it has not changed or the controller is wireless
@@ -1054,7 +1219,7 @@ void Output(int chan, u8 rumble_command)
         0x11, s_controller_rumble[0], s_controller_rumble[1], s_controller_rumble[2],
         s_controller_rumble[3]};
     {
-#if GCADAPTER_USE_ANDROID_IMPLEMENTATION
+#if GCADAPTER_USE_ANDROID_IMPLEMENTATION || GCADAPTER_USE_HORIZON_IMPLEMENTATION
       std::lock_guard lk(s_write_mutex);
 #endif
       s_controller_write_payload = rumble;
@@ -1079,9 +1244,12 @@ bool IsDetected(const char** error_message)
     *error_message = libusb_strerror(s_adapter_error.load());
 
   return false;
-#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION
+#elif GCADAPTER_USE_ANDROID_IMPLEMENTATION || GCADAPTER_USE_HORIZON_IMPLEMENTATION
   return s_detected;
 #else
+  if (error_message)
+    *error_message = nullptr;
+
   return false;
 #endif
 }

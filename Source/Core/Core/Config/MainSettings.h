@@ -119,6 +119,21 @@ extern const Info<bool> MAIN_WIIMOTE_ENABLE_SPEAKER;
 extern const Info<bool> MAIN_CONNECT_WIIMOTES_FOR_CONTROLLER_INTERFACE;
 #ifdef __SWITCH__
 extern const Info<bool> MAIN_SWITCH_TOUCHSCREEN_POINTER;
+enum class GBAScreens
+{
+  Hidden,
+  Small,
+  Large,
+};
+enum class GBAScreenCorner
+{
+  TopLeft,
+  TopRight,
+  BottomLeft,
+  BottomRight,
+};
+extern const Info<GBAScreens> MAIN_SWITCH_GBA_SCREENS;
+extern const Info<GBAScreenCorner> MAIN_SWITCH_GBA_SCREEN_CORNER;
 #endif
 extern const Info<bool> MAIN_MMU;
 extern const Info<bool> MAIN_PAUSE_ON_PANIC;

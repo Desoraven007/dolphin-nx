@@ -194,6 +194,9 @@ void InitControllers(const WindowSystemInfo& wsi)
 
 void ShutdownControllers()
 {
+#ifdef __SWITCH__
+  GCAdapter::Shutdown();
+#endif
   Pad::Shutdown();
   Pad::ShutdownGBA();
   Keyboard::Shutdown();

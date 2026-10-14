@@ -14,7 +14,7 @@
 
 #include <mgba/core/core.h>
 #include <mgba/core/interface.h>
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__SWITCH__)
 #define USE_PTHREADS  // Required for Mutex/Condition in mCoreSync.
 #endif
 #include <mgba/core/sync.h>

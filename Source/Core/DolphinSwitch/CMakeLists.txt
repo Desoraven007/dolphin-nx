@@ -1,6 +1,6 @@
 set(DOLPHIN_SWITCH_RELEASE_NAME "Dolphin")
 set(DOLPHIN_SWITCH_RELEASE_AUTHOR "naga")
-set(DOLPHIN_SWITCH_RELEASE_VERSION "1.1.0" CACHE STRING
+set(DOLPHIN_SWITCH_RELEASE_VERSION "1.2.0" CACHE STRING
     "Semantic release version for the standalone Nintendo Switch frontend")
 
 add_executable(dolphin-switch
@@ -16,6 +16,8 @@ add_executable(dolphin-switch
   ForwarderStructs.h
   FrameGeneration.cpp
   FrameGeneration.h
+  GBAOverlay.cpp
+  GBAOverlay.h
   GciSync.cpp
   GciSync.h
   Launcher.cpp

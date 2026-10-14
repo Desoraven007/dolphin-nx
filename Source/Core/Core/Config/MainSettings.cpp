@@ -216,6 +216,10 @@ const Info<bool> MAIN_CONNECT_WIIMOTES_FOR_CONTROLLER_INTERFACE{
 #ifdef __SWITCH__
 const Info<bool> MAIN_SWITCH_TOUCHSCREEN_POINTER{
     {System::Main, "Core", "SwitchTouchscreenPointer"}, true};
+const Info<GBAScreens> MAIN_SWITCH_GBA_SCREENS{{System::Main, "Switch", "GBAScreens"},
+                                               GBAScreens::Small};
+const Info<GBAScreenCorner> MAIN_SWITCH_GBA_SCREEN_CORNER{
+    {System::Main, "Switch", "GBAScreenCorner"}, GBAScreenCorner::TopRight};
 #endif
 const Info<bool> MAIN_MMU{{System::Main, "Core", "MMU"}, false};
 const Info<bool> MAIN_PAUSE_ON_PANIC{{System::Main, "Core", "PauseOnPanic"}, false};

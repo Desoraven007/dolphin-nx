@@ -95,7 +95,19 @@ void GBAPad::LoadDefaults(const ControllerInterface& ciface)
 {
   EmulatedController::LoadDefaults(ciface);
 
-#ifndef ANDROID
+#if defined(__SWITCH__)
+  SetDefaultDevice(fmt::format("Switch/{}/Joypad", m_index));
+  m_buttons->SetControlExpression(0, "`B`");
+  m_buttons->SetControlExpression(1, "`A`");
+  m_buttons->SetControlExpression(2, "`L`");
+  m_buttons->SetControlExpression(3, "`R`");
+  m_buttons->SetControlExpression(4, "`Select`");
+  m_buttons->SetControlExpression(5, "`Start`");
+  m_dpad->SetControlExpression(0, "`Up` | `Y0+`");
+  m_dpad->SetControlExpression(1, "`Down` | `Y0-`");
+  m_dpad->SetControlExpression(2, "`Left` | `X0-`");
+  m_dpad->SetControlExpression(3, "`Right` | `X0+`");
+#elif !defined(ANDROID)
   // Buttons
   m_buttons->SetControlExpression(0, "`Z`");  // B
   m_buttons->SetControlExpression(1, "`X`");  // A

@@ -45,6 +45,7 @@
 #include <utility>
 #include <vector>
 
+#include "Common/CommonPaths.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
 #include "Common/HookableEvent.h"
@@ -76,6 +77,8 @@
 #include "InputCommon/ControllerInterface/Switch/Switch.h"
 #include "UICommon/GameFile.h"
 #include "UICommon/GameFileCache.h"
+#include "VideoCommon/GraphicsModSystem/Config/GraphicsMod.h"
+#include "VideoCommon/GraphicsModSystem/Config/GraphicsModGroup.h"
 #include "VideoCommon/PostProcessing.h"
 #include "VideoCommon/VideoConfig.h"
 
@@ -1959,6 +1962,10 @@ private:
                                  bool orientation_hotkeys = false);
   void ControllerProfileSettings(bool wii, int port, bool per_game, Game* game);
   void WiiMotionSettings(int port, bool per_game, Game* game);
+  void GBASettings();
+  void GameCubeAdapterSettings(int port, bool per_game, Game* game);
+  void TexturePackSettings(bool per_game, Game* game);
+  void GraphicsModSettings(bool per_game, Game* game);
   void GameModsSettings(Game* game);
   void SaveDataSettings();
   void GCSaveManager(int slot);
@@ -8160,6 +8167,9 @@ void Launcher::GraphicsSettings(bool per_game, Game* game)
                                                    Config::Get(Config::GFX_SHOW_FPS)));
         rows.emplace_back("Enhancements", ">", true, false, false);
         rows.emplace_back("Hacks", ">", true, false, false);
+        rows.emplace_back("Custom textures", ">", true, false, false);
+        rows.emplace_back("Graphics mods", ">", !per_game || (game && !game->game_id.empty()),
+                          false, false);
         return rows;
       },
       [&](int index, int delta) {
@@ -8310,6 +8320,14 @@ void Launcher::GraphicsSettings(bool per_game, Game* game)
         {
           GraphicsHacksSettings(per_game, game);
         }
+        else if (graphics_index == 10)
+        {
+          TexturePackSettings(per_game, game);
+        }
+        else if (graphics_index == 11)
+        {
+          GraphicsModSettings(per_game, game);
+        }
         return false;
       },
       false,
@@ -8368,6 +8386,126 @@ void Launcher::GraphicsSettings(bool per_game, Game* game)
       });
   if (game)
     game->has_game_config = RegularFileExists(GameIniPath(*game));
+}
+
+void Launcher::TexturePackSettings(bool per_game, Game* game)
+{
+  const std::array<const Config::Info<bool>*, 2> settings = {&Config::GFX_HIRES_TEXTURES,
+                                                             &Config::GFX_CACHE_HIRES_TEXTURES};
+  const std::array<std::string_view, 2> labels = {"Load custom textures",
+                                                  "Prefetch custom textures"};
+  const std::array<std::string_view, 2> keys = {"HiresTextures", "CacheHiresTextures"};
+  RunRows(
+      "Custom textures", game ? game->title : "Prefetching uses more memory",
+      [&] {
+        std::vector<Row> rows;
+        for (size_t i = 0; i < settings.size(); ++i)
+        {
+          const bool enabled = Config::Get(*settings[i]);
+          rows.push_back({std::string(labels[i]),
+                          per_game ? PerGameBoolLabel(*game, "Video_Settings", keys[i], enabled) :
+                                     std::string(enabled ? "On" : "Off")});
+        }
+        rows.push_back(
+            {"Texture pack folder",
+             File::GetUserPath(D_HIRESTEXTURES_IDX) + (game ? game->game_id : "<game ID>"), false});
+        return rows;
+      },
+      [&](int index, int delta) {
+        if (index < 0 || index >= static_cast<int>(settings.size()))
+          return false;
+        if (per_game)
+          EditPerGameBool(*game, labels[index], "Video_Settings", keys[index],
+                          Config::Get(*settings[index]), delta);
+        else
+        {
+          Config::SetBase(*settings[index], !Config::Get(*settings[index]));
+          MarkConfigDirty();
+        }
+        return false;
+      },
+      false,
+      [&](int index) {
+        if (index < 0 || index >= static_cast<int>(settings.size()))
+          return false;
+        if (per_game)
+          SetGameSetting(*game, "Video_Settings", keys[index], std::nullopt);
+        else
+          ResetConfigSetting(*settings[index]);
+        return true;
+      });
+}
+
+void Launcher::GraphicsModSettings(bool per_game, Game* game)
+{
+  std::unique_ptr<GraphicsModGroupConfig> group;
+  if (game && !game->game_id.empty())
+  {
+    group = std::make_unique<GraphicsModGroupConfig>(game->game_id);
+    RunBusyTask("Loading graphics mods", game->title, [&] { group->Load(); });
+  }
+  RunRows(
+      "Graphics mods", game ? game->title : "Select a game to choose its mods",
+      [&] {
+        const bool enabled = Config::Get(Config::GFX_MODS_ENABLE);
+        std::vector<Row> rows{
+            {"Enable graphics mods",
+             per_game ? PerGameBoolLabel(*game, "Video_Settings", "EnableMods", enabled) :
+                        std::string(enabled ? "On" : "Off")}};
+        if (group)
+        {
+          for (const auto& mod : group->GetMods())
+          {
+            rows.push_back({mod.m_title.empty() ? "Unnamed mod" : mod.m_title,
+                            mod.m_enabled ? "On" : "Off", true, false, false, false, true});
+          }
+          if (group->GetMods().empty())
+            rows.push_back({"No graphics mods found", "Install a mod in the folder below", false});
+        }
+        rows.push_back({"Graphics mod folder",
+                        File::GetUserPath(D_GRAPHICSMOD_IDX) + (game ? game->game_id : "<game ID>"),
+                        false});
+        return rows;
+      },
+      [&](int index, int delta) {
+        if (index == 0)
+        {
+          if (per_game)
+            EditPerGameBool(*game, "Enable graphics mods", "Video_Settings", "EnableMods",
+                            Config::Get(Config::GFX_MODS_ENABLE), delta);
+          else
+          {
+            Config::SetBase(Config::GFX_MODS_ENABLE, !Config::Get(Config::GFX_MODS_ENABLE));
+            MarkConfigDirty();
+          }
+        }
+        else if (group && index > 0 && index <= static_cast<int>(group->GetMods().size()))
+        {
+          auto& mod = group->GetMods()[index - 1];
+          const int choice = delta == 0 ? Dropdown(mod.m_title, {"Off", "On", "Details"},
+                                                   mod.m_enabled ? 1 : 0, false) :
+                                          (mod.m_enabled ? 0 : 1);
+          if (choice == 2)
+            RenderMessage(mod.m_title, std::array<std::string, 2>{mod.m_author, mod.m_description});
+          else
+          {
+            mod.m_enabled = choice == 1;
+            group->SetChangeCount(group->GetChangeCount() + 1);
+            group->Save();
+          }
+        }
+        return false;
+      },
+      false,
+      [&](int index) {
+        if (index != 0)
+          return false;
+        if (per_game)
+          SetGameSetting(*game, "Video_Settings", "EnableMods", std::nullopt);
+        else
+          ResetConfigSetting(Config::GFX_MODS_ENABLE);
+        return true;
+      });
 }
 
 void Launcher::FrameGenerationSettings(bool per_game, Game* game)
@@ -11341,12 +11479,14 @@ void Launcher::ControllerPortSettings(bool wii, int port, bool per_game, Game* g
 
   if (!wii)
   {
-    static constexpr std::array<SerialInterface::SIDevices, 5> types = {
-        SerialInterface::SIDEVICE_GC_CONTROLLER, SerialInterface::SIDEVICE_GC_STEERING,
-        SerialInterface::SIDEVICE_DANCEMAT, SerialInterface::SIDEVICE_GC_TARUKONGA,
-        SerialInterface::SIDEVICE_AM_BASEBOARD};
-    static constexpr std::array<std::string_view, 5> type_names = {
-        "Standard Controller", "Steering Wheel", "Dance Mat", "DK Bongos", "Triforce Baseboard"};
+    static constexpr std::array<SerialInterface::SIDevices, 7> types = {
+        SerialInterface::SIDEVICE_GC_CONTROLLER,  SerialInterface::SIDEVICE_GC_STEERING,
+        SerialInterface::SIDEVICE_DANCEMAT,       SerialInterface::SIDEVICE_GC_TARUKONGA,
+        SerialInterface::SIDEVICE_AM_BASEBOARD,   SerialInterface::SIDEVICE_WIIU_ADAPTER,
+        SerialInterface::SIDEVICE_GC_GBA_EMULATED};
+    static constexpr std::array<std::string_view, 7> type_names = {
+        "Standard Controller", "Steering Wheel",       "Dance Mat",       "DK Bongos",
+        "Triforce Baseboard",  "GameCube USB Adapter", "Game Boy Advance"};
     const auto game_type_override = [&]() -> std::optional<SerialInterface::SIDevices> {
       if (!per_game || !game)
         return std::nullopt;
@@ -11377,28 +11517,40 @@ void Launcher::ControllerPortSettings(bool wii, int port, bool per_game, Game* g
           const int rumble = read("Rumble/Motor", "`Motor`").empty() ?
                                  0 :
                                  std::clamp(read_int("Rumble/Motor/Range", 100), 0, 100);
+          const bool adapter = effective_type() == SerialInterface::SIDEVICE_WIIU_ADAPTER;
+          const bool gba = effective_type() == SerialInterface::SIDEVICE_GC_GBA_EMULATED;
+          const bool mapping = !adapter && !gba;
           return std::vector<Row>{
               {"Emulated device", std::string(type_names[type_index()])},
-              {"Switch player", "Controller " + std::to_string(player_number() + 1)},
-              {"Joy-Con layout", std::string(ciface::Switch::GetJoyConLayoutName(
-                                     ciface::Switch::GetJoyConLayout(player_number())))},
-              {"Interactive mapping",
+              {"Switch player",
+               "Controller " + std::to_string(mapping ? player_number() + 1 : port + 1), mapping},
+              {"Joy-Con layout",
+               std::string(ciface::Switch::GetJoyConLayoutName(
+                   ciface::Switch::GetJoyConLayout(player_number()))),
+               mapping},
+              {adapter ? "Adapter settings" :
+               gba     ? "GBA settings" :
+                         "Interactive mapping",
+               adapter ? "Rumble / DK Bongos" :
+               gba     ? "BIOS / cartridges / screens" :
                effective_type() == SerialInterface::SIDEVICE_AM_BASEBOARD ?
-                   "Arcade buttons, sticks and triggers" :
-                   "Buttons, sticks and triggers",
+                     "Arcade buttons, sticks and triggers" :
+                     "Buttons, sticks and triggers",
                true, false, false},
-              {"Rumble strength", std::to_string(rumble) + "%"},
-              {"Control Stick dead zone",
-               std::to_string(read_int("Main Stick/Dead Zone", 0)) + "%"},
-              {"C-Stick dead zone", std::to_string(read_int("C-Stick/Dead Zone", 0)) + "%"},
-              {"Trigger dead zone", std::to_string(read_int("Triggers/Dead Zone", 0)) + "%"},
+              {"Rumble strength", std::to_string(rumble) + "%", mapping},
+              {"Control Stick dead zone", std::to_string(read_int("Main Stick/Dead Zone", 0)) + "%",
+               mapping},
+              {"C-Stick dead zone", std::to_string(read_int("C-Stick/Dead Zone", 0)) + "%",
+               mapping},
+              {"Trigger dead zone", std::to_string(read_int("Triggers/Dead Zone", 0)) + "%",
+               mapping},
               {"Profiles",
                per_game && GetControllerTarget(false, port, true, game, false).inherited ?
                    "Global mapping" :
                    "Load / save",
-               true, false, false},
+               mapping, false, false},
               {per_game ? "Reset game mapping" : "Reset Switch defaults",
-               per_game ? "Use global mapping" : "This player only", true, true, false},
+               per_game ? "Use global mapping" : "This player only", mapping, true, false},
           };
         },
         [&](int index, int delta) {
@@ -11450,8 +11602,15 @@ void Launcher::ControllerPortSettings(bool wii, int port, bool per_game, Game* g
             MarkConfigDirty();
           }
           else if (index == 3)
-            ControllerMappingSettings(false, port, per_game, game, false,
-                                      effective_type() == SerialInterface::SIDEVICE_AM_BASEBOARD);
+          {
+            if (effective_type() == SerialInterface::SIDEVICE_GC_GBA_EMULATED)
+              GBASettings();
+            else if (effective_type() == SerialInterface::SIDEVICE_WIIU_ADAPTER)
+              GameCubeAdapterSettings(port, per_game, game);
+            else
+              ControllerMappingSettings(false, port, per_game, game, false,
+                                        effective_type() == SerialInterface::SIDEVICE_AM_BASEBOARD);
+          }
           else if (index >= 4 && index <= 7)
           {
             static constexpr std::array<std::string_view, 4> keys = {
@@ -11693,6 +11852,152 @@ void Launcher::ControllerPortSettings(bool wii, int port, bool per_game, Game* g
       });
 }
 
+void Launcher::GameCubeAdapterSettings(int port, bool per_game, Game* game)
+{
+  const std::array<const Config::Info<bool>*, 2> settings = {
+      &Config::GetInfoForAdapterRumble(port), &Config::GetInfoForSimulateKonga(port)};
+  const std::array<std::string_view, 2> labels = {"Rumble", "Treat as DK Bongos"};
+  const std::array<std::string, 2> keys = {"AdapterRumble" + std::to_string(port),
+                                           "SimulateKonga" + std::to_string(port)};
+  RunRows(
+      "GameCube USB Adapter",
+      "Port " + std::to_string(port + 1) + " uses Horizon player " + std::to_string(port + 1),
+      [&] {
+        std::vector<Row> rows;
+        for (size_t i = 0; i < settings.size(); ++i)
+        {
+          const bool enabled = Config::Get(*settings[i]);
+          rows.push_back({std::string(labels[i]),
+                          per_game ? PerGameBoolLabel(*game, "Core", keys[i], enabled) :
+                                     std::string(enabled ? "On" : "Off")});
+        }
+        return rows;
+      },
+      [&](int index, int delta) {
+        if (per_game)
+          EditPerGameBool(*game, labels[index], "Core", keys[index], Config::Get(*settings[index]),
+                          delta);
+        else
+        {
+          Config::SetBase(*settings[index], !Config::Get(*settings[index]));
+          MarkConfigDirty();
+        }
+        return false;
+      },
+      false,
+      [&](int index) {
+        if (per_game)
+          SetGameSetting(*game, "Core", keys[index], std::nullopt);
+        else
+          ResetConfigSetting(*settings[index]);
+        return true;
+      });
+}
+
+void Launcher::GBASettings()
+{
+  static constexpr std::array<std::string_view, 3> sizes = {"Hidden", "Small", "Large"};
+  static constexpr std::array<std::string_view, 4> corners = {"Top left", "Top right",
+                                                              "Bottom left", "Bottom right"};
+  const auto set_bios = [&](const std::string& path) {
+    Config::SetBase(Config::MAIN_GBA_BIOS_PATH, path);
+    File::SetUserPath(F_GBABIOS_IDX,
+                      path.empty() ? File::GetUserPath(D_GBAUSER_IDX) + GBA_BIOS : path);
+    MarkConfigDirty();
+  };
+  RunRows(
+      "Game Boy Advance link", "GBA N uses Switch controller N; most link games need no cartridge",
+      [&] {
+        const std::string bios = Config::Get(Config::MAIN_GBA_BIOS_PATH);
+        std::vector<Row> rows{{"GBA BIOS", bios.empty() ? File::GetUserPath(F_GBABIOS_IDX) : bios}};
+        for (int port = 0; port < 4; ++port)
+        {
+          const std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[port]);
+          rows.push_back({"GBA " + std::to_string(port + 1) + " cartridge",
+                          rom.empty() ? "None" : rom, true, false, true, true, !rom.empty()});
+        }
+        rows.push_back({"Keep saves next to the cartridge",
+                        Config::Get(Config::MAIN_GBA_SAVES_IN_ROM_PATH) ? "On" : "Off"});
+        rows.push_back(
+            {"GBA screens",
+             std::string(sizes[std::clamp(
+                 static_cast<int>(Config::Get(Config::MAIN_SWITCH_GBA_SCREENS)), 0, 2)])});
+        rows.push_back(
+            {"GBA screen position",
+             std::string(corners[std::clamp(
+                 static_cast<int>(Config::Get(Config::MAIN_SWITCH_GBA_SCREEN_CORNER)), 0, 3)])});
+        rows.push_back({"Default save folder", File::GetUserPath(D_GBASAVES_IDX), false});
+        return rows;
+      },
+      [&](int index, int delta) {
+        if (index >= 0 && index <= 4)
+        {
+          static constexpr std::array<std::string_view, 1> bios_extensions = {".bin"};
+          static constexpr std::array<std::string_view, 8> rom_extensions = {
+              ".gba", ".agb", ".mb", ".gb", ".gbc", ".bin", ".zip", ".7z"};
+          const std::string path =
+              FileBrowser(File::GetUserPath(D_GBAUSER_IDX), false, true, false,
+                          index == 0 ? std::span<const std::string_view>(bios_extensions) :
+                                       std::span<const std::string_view>(rom_extensions),
+                          index == 0 ? "Choose gba_bios.bin" : "Choose a GBA cartridge");
+          if (!path.empty())
+          {
+            if (index == 0)
+              set_bios(path);
+            else
+            {
+              Config::SetBase(Config::MAIN_GBA_ROM_PATHS[index - 1], path);
+              MarkConfigDirty();
+            }
+          }
+        }
+        else if (index == 5)
+        {
+          Config::SetBase(Config::MAIN_GBA_SAVES_IN_ROM_PATH,
+                          !Config::Get(Config::MAIN_GBA_SAVES_IN_ROM_PATH));
+          MarkConfigDirty();
+        }
+        else if (index == 6)
+        {
+          const int selected = SelectChoice(
+              "GBA screens", sizes,
+              std::clamp(static_cast<int>(Config::Get(Config::MAIN_SWITCH_GBA_SCREENS)), 0, 2),
+              delta);
+          Config::SetBase(Config::MAIN_SWITCH_GBA_SCREENS,
+                          static_cast<Config::GBAScreens>(selected));
+          MarkConfigDirty();
+        }
+        else if (index == 7)
+        {
+          const int selected = SelectChoice(
+              "GBA screen position", corners,
+              std::clamp(static_cast<int>(Config::Get(Config::MAIN_SWITCH_GBA_SCREEN_CORNER)), 0,
+                         3),
+              delta);
+          Config::SetBase(Config::MAIN_SWITCH_GBA_SCREEN_CORNER,
+                          static_cast<Config::GBAScreenCorner>(selected));
+          MarkConfigDirty();
+        }
+        return false;
+      },
+      false,
+      [&](int index) {
+        if (index == 0)
+          set_bios({});
+        else if (index >= 1 && index <= 4)
+          ResetConfigSetting(Config::MAIN_GBA_ROM_PATHS[index - 1]);
+        else if (index == 5)
+          ResetConfigSetting(Config::MAIN_GBA_SAVES_IN_ROM_PATH);
+        else if (index == 6)
+          ResetConfigSetting(Config::MAIN_SWITCH_GBA_SCREENS);
+        else if (index == 7)
+          ResetConfigSetting(Config::MAIN_SWITCH_GBA_SCREEN_CORNER);
+        else
+          return false;
+        return true;
+      });
+}
+
 void Launcher::ControllerSettings(bool per_game, Game* game)
 {
   const auto get = [&](std::string_view key) {
@@ -11711,6 +12016,10 @@ void Launcher::ControllerSettings(bool per_game, Game* game)
       return "DK Bongos";
     case SerialInterface::SIDEVICE_AM_BASEBOARD:
       return "Triforce Baseboard";
+    case SerialInterface::SIDEVICE_WIIU_ADAPTER:
+      return "GameCube USB Adapter";
+    case SerialInterface::SIDEVICE_GC_GBA_EMULATED:
+      return "Game Boy Advance";
     default:
       return "Disabled";
     }
@@ -11772,6 +12081,8 @@ void Launcher::ControllerSettings(bool per_game, Game* game)
                       (Config::Get(Config::MAIN_SWITCH_TOUCHSCREEN_POINTER) ? "On" : "Off")) :
                  "Wii games only",
              wii_game});
+        rows.push_back(
+            {"Game Boy Advance link", "BIOS / cartridges / screens", true, false, false});
         return rows;
       },
       [&](int index, int delta) {
@@ -11881,6 +12192,8 @@ void Launcher::ControllerSettings(bool per_game, Game* game)
             MarkConfigDirty();
           }
         }
+        else if (index == 9)
+          GBASettings();
         return false;
       },
       false,
@@ -12878,7 +13191,10 @@ void Launcher::NetworkSettings()
              false},
             {"GameCube BBA / modem",
              gc == ExpansionInterface::EXIDeviceType::None ? "Disabled" : "Configured", true, false,
-             false}};
+             false},
+            {"WiiConnect24 via WiiLink",
+             Config::Get(Config::MAIN_WII_WIILINK_ENABLE) ? "On" : "Off"},
+            {"WiiLink setup", "wiilink.ca", true, false, false}};
       },
       [&](int index, int) {
         std::string error;
@@ -12902,6 +13218,20 @@ void Launcher::NetworkSettings()
         }
         else if (index == 4)
           GameCubeNetworkSettings();
+        else if (index == 5)
+        {
+          Config::SetBase(Config::MAIN_WII_WIILINK_ENABLE,
+                          !Config::Get(Config::MAIN_WII_WIILINK_ENABLE));
+          MarkConfigDirty();
+        }
+        else if (index == 6)
+        {
+          RenderMessage("WiiLink",
+                        std::array<std::string, 3>{
+                            "Setup guide: https://wiilink.ca/",
+                            "Terms of Service: https://www.wiilink24.com/tos",
+                            "Install the patched channels required by the setup guide."});
+        }
         return false;
       });
 }

@@ -38,6 +38,7 @@
 #include "Core/ConfigLoaders/GameConfigLoader.h"
 #include "Core/Core.h"
 #include "Core/HW/DVD/DVDInterface.h"
+#include "Core/HW/GBAPad.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/HW/SI/SI_Device.h"
 #include "Core/HW/Wiimote.h"
@@ -50,6 +51,7 @@
 #include "DolphinSwitch/Audio.h"
 #include "DolphinSwitch/EmbeddedRuntime.h"
 #include "DolphinSwitch/Forwarder.h"
+#include "DolphinSwitch/GBAOverlay.h"
 #include "DolphinSwitch/GciSync.h"
 #include "DolphinSwitch/Launcher.h"
 #include "DolphinSwitch/RuntimeOverlay.h"
@@ -353,7 +355,7 @@ bool Host_UpdateDiscordPresenceRaw(const std::string& details, const std::string
 
 std::unique_ptr<GBAHostInterface> Host_CreateGBAHost(std::weak_ptr<HW::GBA::Core> core)
 {
-  return nullptr;
+  return DolphinSwitch::GBAOverlay::CreateHost(std::move(core));
 }
 
 void Host_Message(HostMessageID id)
@@ -892,8 +894,9 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request,
     if (host_hid_initialized)
     {
       ciface::Switch::UpdatePadState(&runtime_pad);
-      DolphinSwitch::RuntimeOverlay::UpdateInput(padGetButtonsDown(&runtime_pad),
-                                                 padGetButtons(&runtime_pad));
+      DolphinSwitch::RuntimeOverlay::UpdateInput(
+          padGetButtonsDown(&runtime_pad), padGetButtons(&runtime_pad),
+          (runtime_pad.style_set & HidNpadStyleTag_NpadGc) != 0);
     }
     UpdateWiiTouchPointerState(touch_pointer_installed);
 
@@ -969,6 +972,9 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request,
         if (system.GetMovie().IsRecordingInput())
           system.GetMovie().SetReset(true);
         system.GetProcessorInterface().ResetButton_Tap();
+        break;
+      case DolphinSwitch::RuntimeOverlay::ActionType::ResetGBA:
+        Pad::SetGBAReset(action.value, true);
         break;
       case DolphinSwitch::RuntimeOverlay::ActionType::EjectDisc:
         system.GetDVDInterface().EjectDisc(Core::CPUThreadGuard{system}, DVD::EjectCause::User);

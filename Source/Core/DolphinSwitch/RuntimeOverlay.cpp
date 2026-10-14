@@ -35,8 +35,10 @@
 #include "Core/ConfigManager.h"
 #include "Core/GeckoCode.h"
 #include "Core/GeckoCodeConfig.h"
+#include "Core/HW/SI/SI_Device.h"
 #include "Core/State.h"
 #include "DolphinSwitch/FrameGeneration.h"
+#include "DolphinSwitch/GBAOverlay.h"
 #include "VideoCommon/OnScreenUI.h"
 
 namespace DolphinSwitch::RuntimeOverlay
@@ -54,6 +56,7 @@ enum class Page
   Achievements,
   Controllers,
   ControllerModes,
+  GBA,
   Alert,
 };
 
@@ -114,6 +117,7 @@ Page s_page = Page::Main;
 int s_selection = 0;
 int s_controller_player = 0;
 std::array<ControllerMode, 4> s_controller_modes{};
+std::array<bool, 4> s_gba_ports{};
 std::deque<Action> s_actions;
 std::string s_game_path;
 std::string s_game_id;
@@ -629,12 +633,17 @@ void EnterDiscBrowser()
   RequestBrowserDirectoryScan(initial.string());
 }
 
+bool HasGBA()
+{
+  return std::ranges::any_of(s_gba_ports, [](bool connected) { return connected; });
+}
+
 int ItemCount()
 {
   switch (s_page)
   {
   case Page::Main:
-    return MAIN_ITEM_COUNT;
+    return MAIN_ITEM_COUNT + (HasGBA() ? 1 : 0);
   case Page::SaveStates:
   case Page::LoadStates:
     return static_cast<int>(State::NUM_STATES) + 1;
@@ -650,6 +659,8 @@ int ItemCount()
     return CONTROLLER_ITEM_COUNT;
   case Page::ControllerModes:
     return CONTROLLER_MODE_ITEM_COUNT;
+  case Page::GBA:
+    return 7;
   case Page::Alert:
     return 1;
   }
@@ -658,6 +669,8 @@ int ItemCount()
 
 bool ItemAvailable(int index)
 {
+  if (s_page == Page::GBA && index >= 2 && index < 6)
+    return s_gba_ports[index - 2];
   if (s_page != Page::Main)
     return true;
   if (index == 3 && IsHardcoreActive())
@@ -686,6 +699,7 @@ void HandleBack()
     return;
   }
   case Page::Controllers:
+  case Page::GBA:
     SetPage(Page::Main);
     return;
   case Page::ControllerModes:
@@ -695,6 +709,24 @@ void HandleBack()
   default:
     SetPage(Page::Main);
     return;
+  }
+}
+
+void ChangeGBASetting(int delta)
+{
+  if (s_selection == 0)
+  {
+    const int current =
+        std::clamp(static_cast<int>(Config::Get(Config::MAIN_SWITCH_GBA_SCREENS)), 0, 2);
+    Config::SetBase(Config::MAIN_SWITCH_GBA_SCREENS,
+                    static_cast<Config::GBAScreens>((current + delta + 3) % 3));
+  }
+  else if (s_selection == 1)
+  {
+    const int current =
+        std::clamp(static_cast<int>(Config::Get(Config::MAIN_SWITCH_GBA_SCREEN_CORNER)), 0, 3);
+    Config::SetBase(Config::MAIN_SWITCH_GBA_SCREEN_CORNER,
+                    static_cast<Config::GBAScreenCorner>((current + delta + 4) % 4));
   }
 }
 
@@ -747,6 +779,9 @@ void ActivateSelection()
     case 12:
       QueueAction({ActionType::StopToLauncher});
       CloseMenu();
+      break;
+    case 13:
+      SetPage(Page::GBA);
       break;
     }
     break;
@@ -837,6 +872,17 @@ void ActivateSelection()
   case Page::Alert:
     CloseMenu();
     break;
+  case Page::GBA:
+    if (s_selection < 2)
+      ChangeGBASetting(1);
+    else if (s_selection < 6 && s_gba_ports[s_selection - 2])
+    {
+      QueueAction({ActionType::ResetGBA, s_selection - 2});
+      CloseMenu();
+    }
+    else
+      SetPage(Page::Main);
+    break;
   }
 }
 
@@ -903,6 +949,29 @@ void RenderMainPage()
                 10);
   SelectableRow("Reset console", 11);
   SelectableRow("Return to Dolphin launcher", 12);
+  if (HasGBA())
+    SelectableRow("Game Boy Advance                                >", 13);
+}
+
+void RenderGBAPage()
+{
+  static constexpr std::array<std::string_view, 3> sizes = {"Hidden", "Small", "Large"};
+  static constexpr std::array<std::string_view, 4> corners = {"Top left", "Top right",
+                                                              "Bottom left", "Bottom right"};
+  const int size = std::clamp(static_cast<int>(Config::Get(Config::MAIN_SWITCH_GBA_SCREENS)), 0, 2);
+  const int corner =
+      std::clamp(static_cast<int>(Config::Get(Config::MAIN_SWITCH_GBA_SCREEN_CORNER)), 0, 3);
+  SelectableRow("Screens                     <  " + std::string(sizes[size]) + "  >", 0);
+  SelectableRow("Position                    <  " + std::string(corners[corner]) + "  >", 1);
+  for (int port = 0; port < 4; ++port)
+  {
+    if (!s_gba_ports[port])
+      ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(120, 145, 158, 255));
+    SelectableRow("Reset GBA " + std::to_string(port + 1), port + 2);
+    if (!s_gba_ports[port])
+      ImGui::PopStyleColor();
+  }
+  SelectableRow("Back", 6);
 }
 
 void RenderControllersPage()
@@ -1076,11 +1145,13 @@ void InitializeRendererHook()
   StartStateSaveMonitorWorker();
   State::SetOnAfterLoadCallback(&OnStateLoadCompleted);
   VideoCommon::SetImGuiRenderCallback(&Draw);
+  VideoCommon::SetImGuiReleaseCallback(&GBAOverlay::ReleaseTextures);
 }
 
 void ShutdownRendererHook()
 {
   VideoCommon::SetImGuiRenderCallback(nullptr);
+  VideoCommon::SetImGuiReleaseCallback(nullptr);
   State::SetOnAfterLoadCallback({});
   StopBrowserScanWorker();
   StopStateSaveMonitorWorker();
@@ -1097,6 +1168,9 @@ void BeginSession(std::string game_path, std::string game_id, unsigned revision,
   s_game_path = std::move(game_path);
   s_game_id = std::move(game_id);
   s_revision = revision;
+  for (int port = 0; port < 4; ++port)
+    s_gba_ports[port] =
+        Config::Get(Config::GetInfoForSIDevice(port)) == SerialInterface::SIDEVICE_GC_GBA_EMULATED;
   if (s_game_id.empty())
   {
     s_game_id = SConfig::GetInstance().GetGameID();
@@ -1149,9 +1223,10 @@ void EndSession()
   s_achievement_presence.clear();
   s_pending_load_slot = 0;
   s_is_wii = false;
+  s_gba_ports.fill(false);
 }
 
-void UpdateInput(std::uint64_t down, std::uint64_t held)
+void UpdateInput(std::uint64_t down, std::uint64_t held, bool gamecube_adapter)
 {
   std::lock_guard lock{s_mutex};
   if (!s_initialized)
@@ -1164,7 +1239,9 @@ void UpdateInput(std::uint64_t down, std::uint64_t held)
     s_capture_until_release.store(false, std::memory_order_release);
   }
 
-  if ((held & MENU_CHORD) == MENU_CHORD && (down & MENU_CHORD) != 0)
+  const std::uint64_t chord =
+      gamecube_adapter ? (HidNpadButton_ZL | HidNpadButton_ZR | HidNpadButton_Plus) : MENU_CHORD;
+  if ((held & chord) == chord && (down & chord) != 0)
   {
     if (s_visible.load(std::memory_order_relaxed))
       CloseMenu();
@@ -1196,6 +1273,8 @@ void UpdateInput(std::uint64_t down, std::uint64_t held)
   }
   if (down & HidNpadButton_A)
     ActivateSelection();
+  else if (s_page == Page::GBA && (down & (HidNpadButton_Left | HidNpadButton_Right)))
+    ChangeGBASetting((down & HidNpadButton_Left) ? -1 : 1);
 }
 
 std::vector<Action> TakeActions()
@@ -1389,6 +1468,7 @@ void SetControllerModeResult(int player, ControllerMode mode, bool success)
 
 void Draw()
 {
+  GBAOverlay::Draw();
   // Advance once per final-present frame so pause waits for a clean game frame.
   s_render_frame_generation.fetch_add(1, std::memory_order_acq_rel);
   if (!s_visible.load(std::memory_order_acquire))
@@ -1455,6 +1535,9 @@ void Draw()
     case Page::ControllerModes:
       CenteredText(("Player " + std::to_string(s_controller_player + 1) + " Controller").c_str());
       break;
+    case Page::GBA:
+      CenteredText("Game Boy Advance");
+      break;
     case Page::Alert:
       break;
     }
@@ -1469,6 +1552,9 @@ void Draw()
       break;
     case Page::SaveStates:
       RenderStatePage(true);
+      break;
+    case Page::GBA:
+      RenderGBAPage();
       break;
     case Page::LoadStates:
       RenderStatePage(false);

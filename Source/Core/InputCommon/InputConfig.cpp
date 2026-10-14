@@ -34,7 +34,7 @@ bool InputConfig::LoadConfig()
   Common::IniFile inifile;
 #ifdef __SWITCH__
   const bool use_switch_player_defaults =
-      m_ini_name == "GCPadNew" || m_ini_name == WIIMOTE_INI_NAME;
+      m_ini_name == "GCPadNew" || m_ini_name == WIIMOTE_INI_NAME || m_ini_name == "GBA";
 #endif
   bool useProfile[MAX_BBMOTES] = {false, false, false, false, false};
   static constexpr std::array<std::string_view, MAX_BBMOTES> num = {"1", "2", "3", "4", "BB"};

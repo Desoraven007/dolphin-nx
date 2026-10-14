@@ -34,6 +34,7 @@ enum class ActionType
   ToggleFPS,
   ToggleVBISkip,
   SetControllerMode,
+  ResetGBA,
 };
 
 struct Action
@@ -51,7 +52,7 @@ void BeginSession(std::string game_path, std::string game_id, unsigned revision,
                   std::array<ControllerMode, 4> controller_modes);
 void EndSession();
 
-void UpdateInput(std::uint64_t down, std::uint64_t held);
+void UpdateInput(std::uint64_t down, std::uint64_t held, bool gamecube_adapter = false);
 std::vector<Action> TakeActions();
 
 bool IsVisible();

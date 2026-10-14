@@ -5,6 +5,9 @@
 
 #include <cstddef>
 #include <map>
+#ifdef __SWITCH__
+#include <memory_resource>
+#endif
 #include <optional>
 
 #include "Common/Arm64Emitter.h"
@@ -308,6 +311,11 @@ protected:
   void EmitBLRStackLimitCheck(Arm64Gen::ARM64Reg reg);
 #endif
 
+#ifdef __SWITCH__
+  void EmitBeforeHostCall() override;
+  void EmitAfterHostCall() override;
+#endif
+
   void FreeRanges();
   void GenerateAsmAndResetFreeMemoryRanges();
   void ResetFreeMemoryRanges(size_t routines_near_size, size_t routines_far_size);
@@ -340,6 +348,15 @@ protected:
   void WriteBranchWatchDestInRegister(u32 origin, Arm64Gen::ARM64Reg destination,
                                       UGeckoInstruction inst, BitSet32 gpr_caller_save,
                                       BitSet32 fpr_caller_save);
+
+  void ClearSPRSources();
+  void InvalidateSPRSources(BitSet32 written_gprs);
+  BitSet32 GetSPRSourceGPRs() const;
+  void LoadBranchTargetFromSPR(Arm64Gen::ARM64Reg dest, u32 spr);
+
+  Arm64Gen::ARM64Reg BeginGatherPipeWrite();
+  void EndGatherPipeWrite(Arm64Gen::ARM64Reg ptr);
+  void FlushGatherPipePtr();
 
   // Exits
   void
@@ -393,11 +410,21 @@ protected:
   void Force25BitPrecision(Arm64Gen::ARM64Reg output, Arm64Gen::ARM64Reg input);
 
   // <Fast path fault location, slow path handler location>
+#ifdef __SWITCH__
+  std::pmr::unsynchronized_pool_resource m_fault_to_handler_pool;
+  std::pmr::map<const u8*, FastmemArea> m_fault_to_handler{&m_fault_to_handler_pool};
+#else
   std::map<const u8*, FastmemArea> m_fault_to_handler{};
+#endif
   Arm64GPRCache gpr;
   Arm64FPRCache fpr;
 
   JitCommon::ConstantPropagation m_constant_propagation;
+
+  int m_lr_source_gpr = -1;
+  int m_ctr_source_gpr = -1;
+
+  Arm64Gen::ARM64Reg m_gather_pipe_ptr_reg = Arm64Gen::ARM64Reg::INVALID_REG;
 
   JitArm64BlockCache blocks{*this};
 

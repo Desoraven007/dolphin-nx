@@ -24,6 +24,9 @@ constexpr Arm64Gen::ARM64Reg MEM_REG = Arm64Gen::ARM64Reg::X28;
 constexpr Arm64Gen::ARM64Reg PPC_REG = Arm64Gen::ARM64Reg::X29;
 // PC register when calling the dispatcher
 constexpr Arm64Gen::ARM64Reg DISPATCHER_PC = Arm64Gen::ARM64Reg::W26;
+#ifdef __SWITCH__
+constexpr Arm64Gen::ARM64Reg DOWNCOUNT_REG = Arm64Gen::ARM64Reg::W19;
+#endif
 
 #ifdef __GNUC__
 #define PPCSTATE_OFF(elem)                                                                         \
@@ -341,6 +344,8 @@ public:
   u32 GetImm(size_t preg) const;
 
   bool IsImm(size_t preg, u32 imm) const { return IsImm(preg) && GetImm(preg) == imm; }
+
+  bool IsInHostRegister(size_t preg) const { return GetGuestGPROpArg(preg).IsInHostRegister(); }
 
   // Binds a guest GPR to a host register, optionally loading its value.
   //

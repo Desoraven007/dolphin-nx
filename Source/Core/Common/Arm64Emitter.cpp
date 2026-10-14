@@ -898,7 +898,11 @@ void ARM64XEmitter::BL(const void* ptr)
 
 void ARM64XEmitter::QuickCallFunction(ARM64Reg scratchreg, const void* func)
 {
-  s64 distance = (s64)func - (s64)m_code;
+#ifdef __SWITCH__
+  EmitBeforeHostCall();
+#endif
+
+  s64 distance = (s64)func - (s64)GetExecutableCodePtr();
   distance >>= 2;  // Can only branch to opcode-aligned (4) addresses
   if (!IsInRangeImm26(distance))
   {
@@ -907,8 +911,12 @@ void ARM64XEmitter::QuickCallFunction(ARM64Reg scratchreg, const void* func)
   }
   else
   {
-    BL(func);
+    Write32(0x94000000 | MaskImm26(distance));
   }
+
+#ifdef __SWITCH__
+  EmitAfterHostCall();
+#endif
 }
 
 // Unconditional Branch (register)
@@ -3286,6 +3294,11 @@ void ARM64FloatEmitter::FMLS(u8 size, ARM64Reg Rd, ARM64Reg Rn, ARM64Reg Rm)
 void ARM64FloatEmitter::NOT(ARM64Reg Rd, ARM64Reg Rn)
 {
   Emit2RegMisc(IsQuad(Rd), 1, 0, 5, Rd, Rn);
+}
+void ARM64FloatEmitter::CLZ(u8 size, ARM64Reg Rd, ARM64Reg Rn)
+{
+  ASSERT_MSG(DYNA_REC, size != 64, "CLZ has no 64-bit element form!");
+  Emit2RegMisc(IsQuad(Rd), 1, MathUtil::IntLog2(size) - 3, 4, Rd, Rn);
 }
 void ARM64FloatEmitter::ORR(ARM64Reg Rd, ARM64Reg Rn, ARM64Reg Rm)
 {

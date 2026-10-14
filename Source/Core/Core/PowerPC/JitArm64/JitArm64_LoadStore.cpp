@@ -284,7 +284,12 @@ void JitArm64::SafeStoreFromReg(s32 dest, u32 value, s32 regOffset, u32 flags, s
   if (is_immediate)
     mmio_address = m_mmu.IsOptimizableMMIOAccess(imm_addr, access_size);
 
-  if (is_immediate && jo.optimizeGatherPipe && m_mmu.IsOptimizableGatherPipeWrite(imm_addr))
+  const bool gather_pipe_write =
+      is_immediate && jo.optimizeGatherPipe && m_mmu.IsOptimizableGatherPipeWrite(imm_addr);
+  if (!gather_pipe_write)
+    FlushGatherPipePtr();
+
+  if (gather_pipe_write)
   {
     int accessSize;
     if (flags & BackPatchInfo::FLAG_SIZE_32)
@@ -294,19 +299,19 @@ void JitArm64::SafeStoreFromReg(s32 dest, u32 value, s32 regOffset, u32 flags, s
     else
       accessSize = 8;
 
-    LDR(IndexType::Unsigned, ARM64Reg::X2, PPC_REG, PPCSTATE_OFF(gather_pipe_ptr));
+    const ARM64Reg ptr = BeginGatherPipeWrite();
 
     ARM64Reg temp = ARM64Reg::W1;
     temp = ByteswapBeforeStore(this, &m_float_emit, temp, RS, flags, true);
 
     if (accessSize == 32)
-      STR(IndexType::Post, temp, ARM64Reg::X2, 4);
+      STR(IndexType::Post, temp, ptr, 4);
     else if (accessSize == 16)
-      STRH(IndexType::Post, temp, ARM64Reg::X2, 2);
+      STRH(IndexType::Post, temp, ptr, 2);
     else
-      STRB(IndexType::Post, temp, ARM64Reg::X2, 1);
+      STRB(IndexType::Post, temp, ptr, 1);
 
-    STR(IndexType::Unsigned, ARM64Reg::X2, PPC_REG, PPCSTATE_OFF(gather_pipe_ptr));
+    EndGatherPipeWrite(ptr);
 
     js.fifoBytesSinceCheck += accessSize >> 3;
   }
@@ -723,6 +728,7 @@ void JitArm64::dcbx(UGeckoInstruction inst)
 
   if (make_loop)
   {
+    m_ctr_source_gpr = -1;
     gpr.Lock(loop_counter);
     gpr.BindToRegister(b, true);
 
@@ -740,7 +746,11 @@ void JitArm64::dcbx(UGeckoInstruction inst)
     const u8 cycle_count_per_loop =
         js.op[0].opinfo->num_cycles + js.op[1].opinfo->num_cycles + js.op[2].opinfo->num_cycles;
 
+#ifdef __SWITCH__
+    MOV(reg_downcount, DOWNCOUNT_REG);
+#else
     LDR(IndexType::Unsigned, reg_downcount, PPC_REG, PPCSTATE_OFF(downcount));
+#endif
     MOVI2R(WA, 0);
     CMP(reg_downcount, 0);                                          // if (downcount <= 0)
     FixupBranch downcount_is_zero_or_negative = B(CCFlags::CC_LE);  // only do 1 invalidation; else:
@@ -763,7 +773,11 @@ void JitArm64::dcbx(UGeckoInstruction inst)
     // downcount -= (WA * reg_cycle_count)
     MSUB(reg_downcount, WA, reg_cycle_count, reg_downcount);
     // ^ Note that this cannot overflow because it's limited by (downcount/cycle_count).
+#ifdef __SWITCH__
+    MOV(DOWNCOUNT_REG, reg_downcount);
+#else
     STR(IndexType::Unsigned, reg_downcount, PPC_REG, PPCSTATE_OFF(downcount));
+#endif
 
     SetJumpTarget(downcount_is_zero_or_negative);
 

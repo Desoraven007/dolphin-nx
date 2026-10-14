@@ -407,8 +407,12 @@ void JitArm64::mfspr(UGeckoInstruction inst)
     auto& core_timing_globals = m_system.GetCoreTiming().GetGlobals();
     MOVP2R(Xg, &core_timing_globals);
 
+#ifdef __SWITCH__
+    m_float_emit.SCVTF(SC, DOWNCOUNT_REG);
+#else
     LDR(IndexType::Unsigned, WA, PPC_REG, PPCSTATE_OFF(downcount));
     m_float_emit.SCVTF(SC, WA);
+#endif
     m_float_emit.LDR(32, IndexType::Unsigned, SD, Xg,
                      offsetof(CoreTiming::Globals, last_OC_factor_inverted));
     m_float_emit.FMUL(SC, SC, SD);
@@ -563,6 +567,11 @@ void JitArm64::mtspr(UGeckoInstruction inst)
   // OK, this is easy.
   ARM64Reg RD = gpr.IsImm(inst.RD, 0) ? ARM64Reg::WZR : gpr.R(inst.RD);
   STR(IndexType::Unsigned, RD, PPC_REG, PPCSTATE_OFF_SPR(iIndex));
+
+  if (iIndex == SPR_LR)
+    m_lr_source_gpr = inst.RD;
+  else if (iIndex == SPR_CTR)
+    m_ctr_source_gpr = inst.RD;
 }
 
 void JitArm64::crXXX(UGeckoInstruction inst)

@@ -15,6 +15,7 @@
 namespace DiscIO
 {
 struct GameModDescriptorRiivolution;
+struct GameModDescriptorRiivolutionPatch;
 }
 
 namespace DiscIO::Riivolution
@@ -221,6 +222,7 @@ struct Config
 
 std::optional<Disc> ParseFile(const std::string& filename);
 std::optional<Disc> ParseString(std::string_view xml, std::string xml_path);
+void ApplyGameModDescriptorOptions(Disc* disc, const GameModDescriptorRiivolutionPatch& preset);
 std::vector<Patch> GenerateRiivolutionPatchesFromGameModDescriptor(
     const GameModDescriptorRiivolution& descriptor, const std::string& game_id,
     std::optional<u16> revision, std::optional<u8> disc_number);

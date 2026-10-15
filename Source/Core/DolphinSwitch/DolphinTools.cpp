@@ -7,6 +7,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -57,12 +58,11 @@ std::string GetLocalGameIniPath(const std::string& game_id)
   return File::GetUserPath(D_GAMESETTINGS_IDX) + game_id + ".ini";
 }
 
-bool IsSafeIdentifier(std::string_view value)
+bool IsSafeIdentifier(std::string_view value, std::size_t max_length = 32)
 {
-  return !value.empty() && value.size() <= 32 &&
-         std::ranges::all_of(value, [](unsigned char c) {
-           return std::isalnum(c) || c == '-' || c == '_';
-         });
+  return !value.empty() && value.size() <= max_length &&
+         std::ranges::all_of(
+             value, [](unsigned char c) { return std::isalnum(c) || c == '-' || c == '_'; });
 }
 
 Common::IniFile LoadEditableLocalGameIni(const std::string& game_id)
@@ -330,6 +330,47 @@ const char* ResultMessage(Result result)
     return "Storage operation failed";
   }
   return "Unknown error";
+}
+
+Result ClearGameSettings(const std::string& game_id, u16 revision,
+                         std::span<const std::string_view> entry_keys, std::size_t* removed,
+                         std::string* error)
+{
+  *removed = 0;
+  if ((!game_id.empty() && !IsSafeIdentifier(game_id)) ||
+      std::ranges::any_of(entry_keys,
+                          [](std::string_view key) { return !IsSafeIdentifier(key, 96); }))
+  {
+    SetError(error, "Invalid game ID or entry key.");
+    return Result::InvalidData;
+  }
+
+  std::vector<std::string> paths;
+  for (const auto key : entry_keys)
+    paths.push_back(File::GetUserPath(D_RIIVOLUTION_IDX) + "Presets/" + std::string(key) + ".json");
+  for (const auto key : entry_keys)
+    paths.push_back(File::GetUserPath(D_GAMESETTINGS_IDX) + "Entries/" + std::string(key) + ".ini");
+  if (!game_id.empty())
+  {
+    paths.push_back(GetLocalGameIniPath(game_id));
+    paths.push_back(
+        fmt::format("{}{}r{}.ini", File::GetUserPath(D_GAMESETTINGS_IDX), game_id, revision));
+  }
+  for (const std::string& path : paths)
+  {
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (ec == std::errc::no_such_file_or_directory ||
+        (!ec && status.type() == std::filesystem::file_type::not_found))
+      continue;
+    if (ec || std::filesystem::is_directory(status) || !std::filesystem::remove(path, ec))
+    {
+      SetError(error, path);
+      return Result::IoError;
+    }
+    ++*removed;
+  }
+  return Result::Success;
 }
 
 std::vector<ModEntry> LoadGameMods(const std::string& game_id, u16 revision)
@@ -864,9 +905,11 @@ Result ResetWiiNetworkConfiguration(std::string* error)
   return Result::Success;
 }
 
-Result CreateRiivolutionPreset(const std::string& base_game_path, const std::string& game_id,
-                               u16 revision, const std::string& xml_path,
-                               const std::string& output_path, std::string* error)
+Result CreateRiivolutionPreset(
+    const std::string& base_game_path, const std::string& game_id, u16 revision, u8 disc_number,
+    const std::string& xml_path, const std::string& output_path,
+    const std::function<bool(DiscIO::Riivolution::Disc&, std::string&)>& configure,
+    std::string* error)
 {
   if (!File::IsFile(base_game_path) || !IsSafeIdentifier(game_id) || output_path.empty())
   {
@@ -886,13 +929,27 @@ Result CreateRiivolutionPreset(const std::string& base_game_path, const std::str
     SetError(error, "The selected file is not a valid Riivolution XML.");
     return Result::InvalidData;
   }
-  if (!disc->IsValidForGame(game_id, revision, std::nullopt))
+  if (!disc->IsValidForGame(game_id, revision, disc_number))
   {
     SetError(error, "This Riivolution patch does not match the selected game.");
     return Result::InvalidData;
   }
 
-  const std::string root = GetRiivolutionRoot(xml_path);
+  std::string root = GetRiivolutionRoot(xml_path);
+  const auto previous = DiscIO::ParseGameModDescriptorFile(output_path);
+  const DiscIO::GameModDescriptorRiivolutionPatch* saved = nullptr;
+  if (previous && previous->riivolution)
+  {
+    for (const auto& patch : previous->riivolution->patches)
+    {
+      if (patch.xml == xml_path)
+      {
+        saved = &patch;
+        root = patch.root;
+        break;
+      }
+    }
+  }
   if (game_id.size() >= 4)
   {
     const std::string config_path =
@@ -901,6 +958,10 @@ Result CreateRiivolutionPreset(const std::string& base_game_path, const std::str
       DiscIO::Riivolution::ApplyConfigDefaults(&*disc, *config);
   }
 
+  if (saved)
+    DiscIO::Riivolution::ApplyGameModDescriptorOptions(&*disc, *saved);
+  if (!configure(*disc, root))
+    return Result::Cancelled;
   DiscIO::GameModDescriptor descriptor;
   descriptor.base_file = base_game_path;
   descriptor.display_name = "Riivolution - " + game_id;
@@ -912,8 +973,11 @@ Result CreateRiivolutionPreset(const std::string& base_game_path, const std::str
   {
     for (const auto& option : section.m_options)
     {
-      if (option.m_selected_choice == 0 || option.m_selected_choice > option.m_choices.size())
-        continue;
+      if (option.m_selected_choice > option.m_choices.size())
+      {
+        SetError(error, "A Riivolution option has an invalid choice.");
+        return Result::InvalidData;
+      }
       patch.options.push_back(
           {section.m_name, option.m_id, option.m_name, option.m_selected_choice});
     }
@@ -926,6 +990,27 @@ Result CreateRiivolutionPreset(const std::string& base_game_path, const std::str
   {
     SetError(error, "The Riivolution launch descriptor could not be written.");
     return Result::IoError;
+  }
+  if (game_id.size() >= 4)
+  {
+    const std::string config_path =
+        JoinPath(root, fmt::format("riivolution/config/{}.xml", game_id.substr(0, 4)));
+    auto config =
+        DiscIO::Riivolution::ParseConfigFile(config_path).value_or(DiscIO::Riivolution::Config{});
+    for (const auto& section : disc->m_sections)
+    {
+      for (const auto& option : section.m_options)
+      {
+        const std::string id = option.m_id.empty() ? section.m_name + option.m_name : option.m_id;
+        const auto existing =
+            std::ranges::find(config.m_options, id, &DiscIO::Riivolution::ConfigOption::m_id);
+        if (existing == config.m_options.end())
+          config.m_options.push_back({id, option.m_selected_choice});
+        else
+          existing->m_default = option.m_selected_choice;
+      }
+    }
+    (void)DiscIO::Riivolution::WriteConfigFile(config_path, config);
   }
   return Result::Success;
 }

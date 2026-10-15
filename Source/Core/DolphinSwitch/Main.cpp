@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,8 +25,10 @@
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
 #include "Common/HorizonClocks.h"
+#include "Common/IniFile.h"
 #include "Common/MsgHandler.h"
 #include "Common/ScopeGuard.h"
+#include "Common/StringUtil.h"
 #include "Common/Thread.h"
 #include "Common/WindowSystemInfo.h"
 #include "Core/AchievementManager.h"
@@ -36,6 +39,7 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/WiimoteSettings.h"
 #include "Core/ConfigLoaders/GameConfigLoader.h"
+#include "Core/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/GBAPad.h"
@@ -48,6 +52,9 @@
 #include "Core/Movie.h"
 #include "Core/State.h"
 #include "Core/System.h"
+#include "DiscIO/GameModDescriptor.h"
+#include "DiscIO/RiivolutionParser.h"
+#include "DiscIO/RiivolutionPatcher.h"
 #include "DolphinSwitch/Audio.h"
 #include "DolphinSwitch/EmbeddedRuntime.h"
 #include "DolphinSwitch/Forwarder.h"
@@ -279,7 +286,56 @@ std::unique_ptr<BootParameters> GenerateBootParameters(const DolphinSwitch::Laun
   }
   if (request.path.empty())
     return nullptr;
-  return BootParameters::GenerateFromFile(request.path, std::move(session));
+  auto boot = BootParameters::GenerateFromFile(request.path, std::move(session), false);
+  if (!boot)
+    return nullptr;
+  const auto* disc = std::get_if<BootParameters::Disc>(&boot->parameters);
+  std::string extension;
+  SplitPath(request.path, nullptr, nullptr, &extension);
+  Common::ToLower(&extension);
+  if (!disc || extension == ".json")
+    return boot;
+
+  Common::IniFile profile =
+      SConfig::LoadLocalGameIni(disc->volume->GetGameID(), disc->volume->GetRevision());
+  std::string preset;
+  bool enabled = true;
+  profile.GetIfExists("Riivolution", "Preset", &preset);
+  profile.GetIfExists("Riivolution", "Enabled", &enabled, true);
+  if (preset.empty() || !enabled)
+    return boot;
+
+  if (!DolphinSwitch::PrepareLaunchStorage(preset))
+  {
+    PanicAlertFmt("The saved Riivolution preset's storage device is unavailable.");
+    return nullptr;
+  }
+  const auto descriptor = DiscIO::ParseGameModDescriptorFile(preset);
+  if (!descriptor || !descriptor->riivolution)
+  {
+    PanicAlertFmt(
+        "The saved Riivolution preset could not be loaded. Check the game's Riivolution settings.");
+    return nullptr;
+  }
+  for (const auto& patch : descriptor->riivolution->patches)
+  {
+    if (!DolphinSwitch::PrepareLaunchStorage(patch.xml) ||
+        !DolphinSwitch::PrepareLaunchStorage(patch.root))
+    {
+      PanicAlertFmt("The saved Riivolution mod's storage device is unavailable.");
+      return nullptr;
+    }
+  }
+  boot->riivolution_patches = DiscIO::Riivolution::GenerateRiivolutionPatchesFromGameModDescriptor(
+      *descriptor->riivolution, disc->volume->GetGameID(), disc->volume->GetRevision(),
+      disc->volume->GetDiscNumber());
+  if (boot->riivolution_patches.empty())
+  {
+    PanicAlertFmt("No Riivolution patches could be loaded from the saved game profile. Check the "
+                  "XML, selected options and game version.");
+    return nullptr;
+  }
+  return boot;
 }
 
 }  // namespace
@@ -697,6 +753,51 @@ void UpdateSessionPauseState(Core::System& system, bool focused, bool user_pause
   }
 }
 
+void RunWithLoadingScreen(const std::function<void()>& task)
+{
+  Common::HorizonClocks::ScopedCpuBoost boost;
+  consoleInit(nullptr);
+  std::printf("Loading Riivolution...\n\n");
+  consoleUpdate(nullptr);
+
+  std::atomic_bool complete{false};
+  struct Task
+  {
+    const std::function<void()>& run;
+    std::atomic_bool& complete;
+  } context{task, complete};
+  Thread worker{};
+  const Result created = threadCreate(
+      &worker,
+      [](void* userdata) {
+        auto& work = *static_cast<Task*>(userdata);
+        work.run();
+        work.complete.store(true, std::memory_order_release);
+      },
+      &context, nullptr, 2 * 1024 * 1024, 0x2C, -2);
+  const bool worker_created = R_SUCCEEDED(created);
+  const bool worker_started = worker_created && R_SUCCEEDED(threadStart(&worker));
+  if (!worker_started)
+  {
+    task();
+    complete.store(true, std::memory_order_release);
+  }
+  unsigned frames = 0;
+  while (!complete.load(std::memory_order_acquire))
+  {
+    if (!appletMainLoop())
+      s_applet_exit_requested.store(true, std::memory_order_release);
+    std::printf("\rPreparing mod files %c", "|/-\\"[(frames++ / 15) % 4]);
+    consoleUpdate(nullptr);
+    svcSleepThread(16'000'000);
+  }
+  if (worker_started)
+    threadWaitForExit(&worker);
+  if (worker_created)
+    threadClose(&worker);
+  consoleExit(nullptr);
+}
+
 SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request,
                              const std::string& launcher_path)
 {
@@ -716,18 +817,32 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request,
 
   ConfigLoaders::SetLocalGameConfigOverridePath(resolved_request.game_config_path);
   Common::ScopeGuard game_config_guard([] { ConfigLoaders::SetLocalGameConfigOverridePath({}); });
-
-  NWindow* const window = nwindowGetDefault();
-  const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
-  const u32 width = docked ? 1920 : 1280;
-  const u32 height = docked ? 1080 : 720;
-  if (!ConfigureDefaultNWindow(window, width, height))
+  std::string extension;
+  SplitPath(resolved_request.path, nullptr, nullptr, &extension);
+  Common::ToLower(&extension);
+  if (extension == ".json")
   {
-    return {false, "The display could not be configured after the launcher."};
+    const auto descriptor = DiscIO::ParseGameModDescriptorFile(resolved_request.path);
+    if (descriptor)
+    {
+      std::vector<std::string> dependencies{descriptor->base_file};
+      if (descriptor->riivolution)
+      {
+        for (const auto& patch : descriptor->riivolution->patches)
+        {
+          dependencies.push_back(patch.xml);
+          dependencies.push_back(patch.root);
+        }
+      }
+      for (const auto& dependency : dependencies)
+      {
+        if (!DolphinSwitch::PrepareLaunchStorage(dependency))
+        {
+          return {false, "The mod preset's storage device is unavailable."};
+        }
+      }
+    }
   }
-  const WindowSystemInfo wsi{WindowSystemType::Switch, nullptr, window, window};
-  UICommon::InitControllers(wsi);
-  Common::ScopeGuard controller_guard([] { UICommon::ShutdownControllers(); });
 
   std::unique_ptr<BootParameters> boot = GenerateBootParameters(resolved_request);
   if (!boot)
@@ -735,6 +850,33 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request,
     return {false,
             CollectAlertText("Dolphin could not create boot parameters for the selected title.")};
   }
+  for (const auto& patch : boot->riivolution_patches)
+  {
+    for (const auto& memory : patch.m_memory_patches)
+    {
+      if (memory.m_valuefile.empty())
+        continue;
+      const auto size = patch.m_file_data_loader->GetExternalFileSize(memory.m_valuefile);
+      if (!size || *size == 0)
+      {
+        return {false, "A required Riivolution mod file is missing or empty. Check the SD root and "
+                       "mod files."};
+      }
+    }
+  }
+
+  if (s_applet_exit_requested.load(std::memory_order_acquire))
+    return {false, {}};
+
+  NWindow* const window = nwindowGetDefault();
+  const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
+  const u32 width = docked ? 1920 : 1280;
+  const u32 height = docked ? 1080 : 720;
+  if (!ConfigureDefaultNWindow(window, width, height))
+    return {false, "The display could not be configured after loading the game."};
+  const WindowSystemInfo wsi{WindowSystemType::Switch, nullptr, window, window};
+  UICommon::InitControllers(wsi);
+  Common::ScopeGuard controller_guard([] { UICommon::ShutdownControllers(); });
 
   std::atomic_bool ever_running{false};
   s_session_running.store(true, std::memory_order_release);
@@ -761,9 +903,10 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request,
   std::string handoff_error;
   std::optional<Common::HorizonClocks::ScopedCpuBoost> boot_boost;
   std::optional<std::uint64_t> frames_when_running;
+  BootParameters* const pending_boot = boot.get();
   const auto prepare_session = [&] {
-#ifdef DOLPHIN_SWITCH_DEKO3D_RUNTIME
     boot_boost.emplace();
+#ifdef DOLPHIN_SWITCH_DEKO3D_RUNTIME
     Config::SetCurrent(Config::MAIN_GFX_BACKEND, std::string("Deko3D"));
     if (Config::Get(Config::GFX_LSFG_ENABLED) &&
         Deko3D::FrameGeneration::GetShaderStatus() ==
@@ -795,8 +938,21 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request,
           DolphinSwitch::LaunchEmbeddedRuntime(launcher_path, resolved_request, &handoff_error);
       return false;
     }
-    boot_boost.emplace();
 #endif
+    if (!pending_boot->riivolution_patches.empty())
+    {
+      RunWithLoadingScreen([&] {
+        AddRiivolutionPatches(pending_boot, std::move(pending_boot->riivolution_patches));
+      });
+      const auto* disc = std::get_if<BootParameters::Disc>(&pending_boot->parameters);
+      if (!disc || !disc->volume || !ConfigureDefaultNWindow(window, width, height))
+      {
+        handoff_error = "Could not prepare the Riivolution-patched game.";
+        return false;
+      }
+      if (s_applet_exit_requested.load(std::memory_order_acquire))
+        return false;
+    }
     return gci_sync.Prepare(system, &gci_prepare_error);
   };
   if (!BootManager::BootCore(system, std::move(boot), wsi, prepare_session))
@@ -885,7 +1041,9 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request,
       if (!frames_when_running)
         frames_when_running = frames;
       else if (frames != *frames_when_running)
+      {
         boot_boost.reset();
+      }
     }
 
     for (PendingAlert& alert : TakePendingAlerts())

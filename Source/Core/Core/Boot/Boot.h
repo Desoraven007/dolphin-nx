@@ -140,10 +140,12 @@ struct BootParameters
   };
 
   static std::unique_ptr<BootParameters>
-  GenerateFromFile(std::string boot_path, BootSessionData boot_session_data_ = BootSessionData());
+  GenerateFromFile(std::string boot_path, BootSessionData boot_session_data_ = BootSessionData(),
+                   bool apply_riivolution_patches = true);
   static std::unique_ptr<BootParameters>
   GenerateFromFile(std::vector<std::string> paths,
-                   BootSessionData boot_session_data_ = BootSessionData());
+                   BootSessionData boot_session_data_ = BootSessionData(),
+                   bool apply_riivolution_patches = true);
 
   using Parameters = std::variant<Disc, Executable, DiscIO::VolumeWAD, NANDTitle, IPL, DFF>;
   BootParameters(Parameters&& parameters_, BootSessionData boot_session_data_ = BootSessionData());

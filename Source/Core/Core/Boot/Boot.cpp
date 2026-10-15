@@ -187,14 +187,16 @@ BootParameters::BootParameters(Parameters&& parameters_, BootSessionData boot_se
 }
 
 std::unique_ptr<BootParameters> BootParameters::GenerateFromFile(std::string boot_path,
-                                                                 BootSessionData boot_session_data_)
+                                                                 BootSessionData boot_session_data_,
+                                                                 bool apply_riivolution_patches)
 {
   return GenerateFromFile(std::vector<std::string>{std::move(boot_path)},
-                          std::move(boot_session_data_));
+                          std::move(boot_session_data_), apply_riivolution_patches);
 }
 
 std::unique_ptr<BootParameters> BootParameters::GenerateFromFile(std::vector<std::string> paths,
-                                                                 BootSessionData boot_session_data_)
+                                                                 BootSessionData boot_session_data_,
+                                                                 bool apply_riivolution_patches)
 {
   ASSERT(!paths.empty());
 
@@ -285,7 +287,8 @@ std::unique_ptr<BootParameters> BootParameters::GenerateFromFile(std::vector<std
     auto descriptor = DiscIO::ParseGameModDescriptorFile(path);
     if (descriptor)
     {
-      auto boot_params = GenerateFromFile(descriptor->base_file, std::move(boot_session_data_));
+      auto boot_params = GenerateFromFile(descriptor->base_file, std::move(boot_session_data_),
+                                          apply_riivolution_patches);
       if (!boot_params)
       {
         // The recursive call reports the precise error (missing file, invalid image, and so on).
@@ -294,13 +297,31 @@ std::unique_ptr<BootParameters> BootParameters::GenerateFromFile(std::vector<std
         return nullptr;
       }
 
+#ifdef __SWITCH__
+      if (descriptor->riivolution && !std::holds_alternative<Disc>(boot_params->parameters))
+      {
+        PanicAlertFmtT("Riivolution patches require a GameCube or Wii disc image.");
+        return nullptr;
+      }
+#endif
       if (descriptor->riivolution && std::holds_alternative<Disc>(boot_params->parameters))
       {
         const auto& volume = *std::get<Disc>(boot_params->parameters).volume;
-        AddRiivolutionPatches(boot_params.get(),
-                              DiscIO::Riivolution::GenerateRiivolutionPatchesFromGameModDescriptor(
-                                  *descriptor->riivolution, volume.GetGameID(),
-                                  volume.GetRevision(), volume.GetDiscNumber()));
+        auto patches = DiscIO::Riivolution::GenerateRiivolutionPatchesFromGameModDescriptor(
+            *descriptor->riivolution, volume.GetGameID(), volume.GetRevision(),
+            volume.GetDiscNumber());
+#ifdef __SWITCH__
+        if (patches.empty())
+        {
+          PanicAlertFmtT("No Riivolution patches could be loaded. Check the XML, selected options "
+                         "and game version.");
+          return nullptr;
+        }
+#endif
+        if (apply_riivolution_patches)
+          AddRiivolutionPatches(boot_params.get(), std::move(patches));
+        else
+          boot_params->riivolution_patches = std::move(patches);
       }
 
       return boot_params;

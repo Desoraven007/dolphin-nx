@@ -150,7 +150,7 @@
   "Configures console language and video flags, Wii system options, the emulated SD card and GameCube expansion slots.": "Configure la langue et les indicateurs vidéo de la console, les options système Wii, la carte SD émulée et les ports d’extension GameCube.",
   "Configures four GameCube ports and four emulated Wii Remotes, including mappings, extensions, motion and rumble.": "Configure quatre ports GameCube et quatre Wii Remotes émulées, notamment leurs mappages, extensions, mouvements et vibrations.",
   "Configures Wii networking, GameCube Broadband Adapter networking and NAND certificates used by online services.": "Configure le réseau Wii, le réseau de l’adaptateur haut débit GameCube et les certificats NAND utilisés par les services en ligne.",
-  "Manages Dolphin patches, Action Replay and Gecko codes, and launches the game with a Riivolution XML patch set.": "Gère les patchs Dolphin, les codes Action Replay et Gecko, et lance le jeu avec un ensemble de patchs XML Riivolution.",
+  "Manages Dolphin patches, Action Replay and Gecko codes, and the game's Riivolution patch settings.": "Gère les patchs Dolphin, les codes Action Replay et Gecko, ainsi que les paramètres des patchs Riivolution du jeu.",
   "Selects how Dolphin executes PowerPC code. JIT ARM64 is the normal high-performance choice; the interpreters are much slower and are mainly useful for diagnosis.": "Sélectionne la manière dont Dolphin exécute le code PowerPC. JIT ARM64 est le choix habituel pour de hautes performances ; les interpréteurs sont bien plus lents et servent surtout au diagnostic.",
   "Runs the emulated CPU and GPU work on separate host threads. It usually improves performance, but a small number of games require it disabled for correct timing.": "Exécute les tâches CPU et GPU émulées sur des threads hôtes distincts. Cela améliore généralement les performances, mais quelques jeux exigent sa désactivation pour conserver un timing correct.",
   "Allows enabled Action Replay, Gecko and patch codes to run. Individual codes are selected from the game's patches and cheats page.": "Autorise l’exécution des codes Action Replay, Gecko et des patchs activés. Les codes individuels se choisissent dans la page des patchs et triches du jeu.",
@@ -288,7 +288,7 @@
   "Assigns the input used to recenter the gyro pointer's yaw and pitch during play.": "Attribue l’entrée utilisée pour recentrer le lacet et le tangage du pointeur gyroscopique pendant le jeu.",
   "Shows the recommended procedure for learning gyroscope bias and keeping pointer input stable.": "Affiche la procédure recommandée pour mesurer le biais du gyroscope et maintenir la stabilité du pointeur.",
   "Downloads available Gecko codes for this game from the configured online database and merges new entries into Dolphin's game configuration.": "Télécharge les codes Gecko disponibles pour ce jeu depuis la base de données en ligne configurée et ajoute les nouvelles entrées à la configuration du jeu de Dolphin.",
-  "Chooses a Riivolution XML patch definition and launches the game with its replacement files and options.": "Choisit une définition de patch XML Riivolution et lance le jeu avec ses fichiers de remplacement et ses options.",
+  "Selects a Riivolution XML file and saves its replacement-file options for this game.": "Sélectionne un fichier XML Riivolution et enregistre ses options de remplacement de fichiers pour ce jeu.",
   "Enables or disables Dolphin's patch, Action Replay and Gecko execution for this game.": "Active ou désactive l’exécution des patchs, d’Action Replay et de Gecko par Dolphin pour ce jeu.",
   "Changes the launcher's background and visual style. It has no effect on Dolphin's in-game renderer or performance.": "Change l’arrière-plan et le style visuel du launcher. Cela n’affecte ni le moteur de rendu en jeu de Dolphin ni ses performances.",
   "Sets how many game covers appear across each library row. More columns make every cover smaller.": "Définit le nombre de jaquettes affichées sur chaque ligne de la bibliothèque. Plus il y a de colonnes, plus chaque jaquette est petite.",
@@ -358,5 +358,12 @@
   "General": "Général",
   "Preview unavailable": "Aperçu indisponible",
   "Use artwork": "Utiliser l'illustration",
-  "Select": "Sélectionner"
+  "Select": "Sélectionner",
+  "Riivolution options": "Options Riivolution",
+  "SD root": "Racine SD",
+  "Select mod root": "Choisir la racine du mod",
+  "Select Riivolution XML": "Choisir le XML Riivolution",
+  "Riivolution XML": "XML Riivolution",
+  "Gecko codes": "Codes Gecko",
+  "Cheat codes": "Codes de triche"
 }

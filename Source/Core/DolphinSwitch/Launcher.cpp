@@ -49,6 +49,7 @@
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
 #include "Common/HookableEvent.h"
+#include "Common/HorizonClocks.h"
 #include "Common/IniFile.h"
 #include "Common/ScopeGuard.h"
 #include "Core/AchievementManager.h"
@@ -64,6 +65,8 @@
 #include "Core/PowerPC/PowerPC.h"
 #include "DiscIO/DirectoryBlob.h"
 #include "DiscIO/Enums.h"
+#include "DiscIO/GameModDescriptor.h"
+#include "DiscIO/RiivolutionParser.h"
 #include "DolphinSwitch/CoverDownload.h"
 #include "DolphinSwitch/DolphinTools.h"
 #include "DolphinSwitch/EmbeddedRuntime.h"
@@ -1048,6 +1051,7 @@ struct Row
   bool localize_label = true;
   bool localize_value = true;
   std::optional<SDL_Color> value_color;
+  bool section_heading = false;
 };
 
 struct SettingHelpEntry
@@ -1098,8 +1102,8 @@ static constexpr SettingHelpEntry SETTING_HELP[] = {
      "Configures Wii networking, GameCube Broadband Adapter networking and NAND certificates used "
      "by online services."},
     {"Patches / AR / Gecko / Riivolution", "Settings group",
-     "Manages Dolphin patches, Action Replay and Gecko codes, and launches the game with a "
-     "Riivolution XML patch set."},
+     "Manages Dolphin patches, Action Replay and Gecko codes, and the game's Riivolution patch "
+     "settings."},
 
     {"CPU engine", "CPU emulation",
      "Selects how Dolphin executes PowerPC code. JIT ARM64 is the normal high-performance choice; "
@@ -1498,9 +1502,8 @@ static constexpr SettingHelpEntry SETTING_HELP[] = {
     {"Download Gecko codes", "Game modification",
      "Downloads available Gecko codes for this game from the configured online database and merges "
      "new entries into Dolphin's game configuration."},
-    {"Launch with Riivolution XML", "Game modification",
-     "Chooses a Riivolution XML patch definition and launches the game with its replacement files "
-     "and options."},
+    {"Riivolution XML", "Game modification",
+     "Selects a Riivolution XML file and saves its replacement-file options for this game."},
     {"Cheat engine", "Cheat engine",
      "Enables or disables Dolphin's patch, Action Replay and Gecko execution for this game."},
 
@@ -1908,6 +1911,8 @@ private:
   void Toast(std::string message, int milliseconds = 900);
   bool Confirm(std::string_view title, std::span<const std::string> lines,
                bool localize_lines = false);
+  bool RiivolutionOptions(const Game& game, DiscIO::Riivolution::Disc& disc, std::string& root);
+  bool RestoreRiivolutionProfile(Game& game);
   int Dropdown(std::string_view title, const std::vector<std::string>& choices, int current,
                bool localize_title = true, bool localize_choices = true);
   int SelectChoice(std::string_view title, std::span<const std::string_view> choices, int current,
@@ -2072,6 +2077,7 @@ private:
                       std::tuple<std::string_view, std::string_view, std::optional<std::string>>>
                       edits);
   void InvalidateGameSettingCache(const Game& game) const;
+  void ClearGameSettings(Game& game);
   std::string PerGameBoolLabel(const Game& game, std::string_view section, std::string_view key,
                                bool global, bool inverted = false) const;
   void EditPerGameBool(Game& game, std::string_view title, std::string_view section,
@@ -6130,6 +6136,11 @@ int Launcher::RunRows(std::string_view title, std::string_view context,
     if (rows.empty())
       return finish(-1);
     selection = std::clamp(selection, 0, static_cast<int>(rows.size()) - 1);
+    const auto skip_heading = [&](int direction = 1) {
+      for (std::size_t count = 0; count < rows.size() && rows[selection].section_heading; ++count)
+        selection = (selection + direction + static_cast<int>(rows.size())) % rows.size();
+    };
+    skip_heading();
     SDL_Event event{};
     while (PollEvent(&event))
     {
@@ -6137,7 +6148,10 @@ int Launcher::RunRows(std::string_view title, std::string_view context,
       int touch_y = 0;
       const TouchKind touch = FeedTouch(event, &touch_x, &touch_y);
       if (TouchScrollList(touch, &selection, &top, static_cast<int>(rows.size()), visible))
+      {
+        skip_heading(touch == TouchKind::ScrollDown ? -1 : 1);
         continue;
+      }
       if ((touch == TouchKind::SwipeLeft || touch == TouchKind::SwipeRight) &&
           rows[selection].enabled && rows[selection].adjustable)
       {
@@ -6156,6 +6170,8 @@ int Launcher::RunRows(std::string_view title, std::string_view context,
             touch_y < list_top + visible * row_height && index >= 0 &&
             index < static_cast<int>(rows.size()))
         {
+          if (rows[index].section_heading)
+            continue;
           selection = index;
           if ((touch_activates_full_row || touch_x >= column_x + column_width / 2) &&
               rows[index].enabled && action(index, 0))
@@ -6260,8 +6276,21 @@ int Launcher::RunRows(std::string_view title, std::string_view context,
     const int column_x = (m_width - column_width) / 2;
     const int label_x = column_x + 40;
     const int value_x = column_x + column_width - 40;
-    GlassPanel(column_x - 12, list_top - 10, column_width + 24,
-               std::min(visible, static_cast<int>(rows.size()) - top) * row_height + 18);
+    const int last_visible = std::min(top + visible, static_cast<int>(rows.size()));
+    for (int first = top; first < last_visible;)
+    {
+      if (rows[first].section_heading)
+      {
+        ++first;
+        continue;
+      }
+      int end = first + 1;
+      while (end < last_visible && !rows[end].section_heading)
+        ++end;
+      GlassPanel(column_x - 12, list_top + (first - top) * row_height - 10, column_width + 24,
+                 (end - first) * row_height + 18);
+      first = end;
+    }
     const float target_y = static_cast<float>(list_top + (selection - top) * row_height + 1);
     m_highlight_y = (!m_animations || m_highlight_y < 0.0f) ?
                         target_y :
@@ -6271,6 +6300,12 @@ int Launcher::RunRows(std::string_view title, std::string_view context,
     {
       const int index = top + row;
       const int slot_y = list_top + row * row_height;
+      if (rows[index].section_heading)
+      {
+        DrawSectionHeading(rows[index].label, column_x,
+                           slot_y + (row_height - FontHeight(m_font_small)) / 2, column_width);
+        continue;
+      }
       const bool current = index == selection;
       const SDL_Color label_color = !rows[index].enabled    ? m_dim :
                                     rows[index].destructive ? SDL_Color{255, 120, 120, 255} :
@@ -7434,6 +7469,37 @@ void Launcher::InvalidateGameSettingCache(const Game& game) const
   const std::string shared_path = SharedGameIniPath(game);
   if (!shared_path.empty() && shared_path != path)
     m_game_ini_cache.erase(shared_path);
+}
+
+void Launcher::ClearGameSettings(Game& game)
+{
+  std::vector<std::string> keys{game.key};
+  if (game.allow_legacy_path_migration)
+  {
+    if (!game.legacy_key.empty())
+      keys.push_back(game.legacy_key);
+    keys.push_back(Hex64(HashPath(Lower(NormalizePath(game.path)))));
+  }
+  std::vector<std::string_view> entry_keys;
+  for (const auto& key : keys)
+    entry_keys.push_back(key);
+  std::size_t removed = 0;
+  std::string error;
+  const Tools::Result result =
+      Tools::ClearGameSettings(game.game_id, game.revision, entry_keys, &removed, &error);
+  m_game_ini_cache.clear();
+  ClearControllerValueCache();
+  game.has_game_config = RegularFileExists(GameIniPath(game));
+  for (auto& other : m_games)
+  {
+    if (!game.game_id.empty() && other.game_id == game.game_id)
+      other.has_game_config = RegularFileExists(GameIniPath(other));
+  }
+  if (result == Tools::Result::Success)
+    Toast(removed ? "Game settings cleared" : "No game settings found", 900);
+  else
+    RenderMessage("Clear game settings",
+                  std::array<std::string, 2>{Tools::ResultMessage(result), error}, true);
 }
 
 std::string Launcher::PerGameBoolLabel(const Game& game, std::string_view section,
@@ -11872,6 +11938,70 @@ void Launcher::ControllerSettings(bool per_game, Game* game)
     game->has_game_config = RegularFileExists(GameIniPath(*game));
 }
 
+bool Launcher::RestoreRiivolutionProfile(Game& game)
+{
+  if (GetGameSetting(game, "Riivolution", "Preset") ||
+      GetGameSetting(game, "Riivolution", "Enabled"))
+    return true;
+  const std::string path = File::GetUserPath(D_RIIVOLUTION_IDX) + "Presets/" + game.key + ".json";
+  const auto preset = DiscIO::ParseGameModDescriptorFile(path);
+  if (!preset || !preset->riivolution || preset->base_file != game.path)
+    return true;
+  if (!SetGameSettings(game, {{"Riivolution", "Preset", path}, {"Riivolution", "Enabled", "True"}}))
+  {
+    RenderMessage("Riivolution setup failed",
+                  std::array<std::string, 1>{"The Riivolution settings could not be saved."}, true);
+    return false;
+  }
+  game.has_game_config = true;
+  return true;
+}
+
+bool Launcher::RiivolutionOptions(const Game& game, DiscIO::Riivolution::Disc& disc,
+                                  std::string& root)
+{
+  std::vector<std::pair<std::string, DiscIO::Riivolution::Option*>> options;
+  for (auto& section : disc.m_sections)
+  {
+    for (auto& option : section.m_options)
+    {
+      if (option.m_selected_choice > option.m_choices.size())
+        option.m_selected_choice = 0;
+      options.emplace_back(section.m_name + " · " + option.m_name, &option);
+    }
+  }
+  RunRows(
+      "Riivolution options", game.title,
+      [&] {
+        std::vector<Row> rows{{"SD root", root, true, false, false}};
+        for (const auto& [name, option] : options)
+        {
+          const std::string choice = option->m_selected_choice == 0 ?
+                                         "Disabled" :
+                                         option->m_choices[option->m_selected_choice - 1].m_name;
+          rows.push_back({name, choice, true, false, true});
+        }
+        return rows;
+      },
+      [&](int index, int delta) {
+        if (index == 0)
+        {
+          const std::string selected = FileBrowser(root, true, false, false, {}, "Select mod root");
+          if (!selected.empty())
+            root = selected;
+          return false;
+        }
+        auto& option = *options[index - 1].second;
+        std::vector<std::string_view> choices{"Disabled"};
+        for (const auto& choice : option.m_choices)
+          choices.push_back(choice.m_name);
+        option.m_selected_choice = static_cast<u32>(
+            SelectChoice(options[index - 1].first, choices, option.m_selected_choice, delta));
+        return false;
+      });
+  return m_running;
+}
+
 void Launcher::GameModsSettings(Game* game)
 {
   if (!game || game->game_id.empty())
@@ -11881,6 +12011,18 @@ void Launcher::GameModsSettings(Game* game)
                   true);
     return;
   }
+  if (!RestoreRiivolutionProfile(*game))
+    return;
+
+  const std::string default_descriptor =
+      File::GetUserPath(D_RIIVOLUTION_IDX) + "Presets/" + game->key + ".json";
+  std::string descriptor = GetGameSetting(*game, "Riivolution", "Preset").value_or("");
+  std::string xml;
+  if (const auto saved = DiscIO::ParseGameModDescriptorFile(descriptor);
+      saved && saved->riivolution && !saved->riivolution->patches.empty())
+    xml = saved->riivolution->patches.front().xml;
+  if (descriptor.empty())
+    descriptor = default_descriptor;
 
   std::vector<Tools::ModEntry> mods = Tools::LoadGameMods(game->game_id, game->revision);
   const auto reload = [&] { mods = Tools::LoadGameMods(game->game_id, game->revision); };
@@ -11891,11 +12033,22 @@ void Launcher::GameModsSettings(Game* game)
         const bool cheats = local ? Lower(*local) == "true" || *local == "1" :
                                     Config::Get(Config::MAIN_ENABLE_CHEATS);
         const std::string cheat_label = cheats ? "Enabled" : "Disabled";
-        std::vector<Row> rows{
-            {"Download Gecko codes", "GameTDB / RC24", true, false, false},
-            {"Launch with Riivolution XML", "Choose patch set", true, false, false},
-            {"Cheat engine", cheat_label}};
-        rows.reserve(mods.size() + 3);
+        const std::string enabled =
+            Lower(GetGameSetting(*game, "Riivolution", "Enabled").value_or("True"));
+        const bool riivolution = !xml.empty() && (enabled == "true" || enabled == "1");
+        std::vector<Row> rows{{"Riivolution", riivolution ? "Enabled" : "Disabled", !xml.empty()},
+                              {"Riivolution XML", xml.empty() ? "Choose patch set" : FileName(xml),
+                               true, false, false, true, xml.empty()},
+                              {"Download Gecko codes", "GameTDB / RC24", true, false, false},
+                              {"Cheat engine", cheat_label}};
+        rows.reserve(mods.size() + 5);
+        if (!mods.empty())
+        {
+          const bool only_gecko = std::ranges::all_of(
+              mods, [](const Tools::ModEntry& mod) { return mod.type == Tools::ModType::Gecko; });
+          rows.push_back({only_gecko ? "Gecko codes" : "Cheat codes", "", false, false, false});
+          rows.back().section_heading = true;
+        }
         for (const Tools::ModEntry& mod : mods)
         {
           const std::string type = mod.type == Tools::ModType::Patch        ? "Patch" :
@@ -11908,6 +12061,58 @@ void Launcher::GameModsSettings(Game* game)
       },
       [&](int index, int delta) {
         if (index == 0)
+        {
+          const std::string enabled =
+              Lower(GetGameSetting(*game, "Riivolution", "Enabled").value_or("True"));
+          if (!SetGameSetting(*game, "Riivolution", "Enabled",
+                              enabled == "true" || enabled == "1" ? "False" : "True"))
+            RenderMessage(
+                "Riivolution setup failed",
+                std::array<std::string, 1>{"The Riivolution settings could not be saved."}, true);
+        }
+        else if (index == 1)
+        {
+          static constexpr std::array<std::string_view, 1> xml_extensions = {".xml"};
+          const bool existing = !xml.empty();
+          const std::string selected =
+              existing ? xml :
+                         FileBrowser(File::GetUserPath(D_RIIVOLUTION_IDX), false, true, false,
+                                     xml_extensions, "Select Riivolution XML");
+          if (selected.empty())
+            return false;
+          bool active = false;
+          std::string error;
+          const Tools::Result result = Tools::CreateRiivolutionPreset(
+              game->path, game->game_id, game->revision,
+              game->metadata ? game->metadata->GetDiscNumber() : 0, selected, descriptor,
+              [&](DiscIO::Riivolution::Disc& disc, std::string& root) {
+                if (!RiivolutionOptions(*game, disc, root))
+                  return false;
+                active = !disc.GeneratePatches(game->game_id).empty();
+                return true;
+              },
+              &error);
+          if (result == Tools::Result::Success)
+          {
+            const std::string previous =
+                Lower(GetGameSetting(*game, "Riivolution", "Enabled").value_or("True"));
+            const bool enabled = active && (!existing || previous == "true" || previous == "1");
+            if (!SetGameSettings(*game, {{"Riivolution", "Preset", descriptor},
+                                         {"Riivolution", "Enabled", enabled ? "True" : "False"}}))
+              RenderMessage(
+                  "Riivolution setup failed",
+                  std::array<std::string, 1>{"The Riivolution settings could not be saved."}, true);
+            else
+              xml = selected;
+          }
+          else if (result != Tools::Result::Cancelled)
+          {
+            RenderMessage(
+                "Riivolution setup failed",
+                std::array<std::string, 1>{error.empty() ? Tools::ResultMessage(result) : error});
+          }
+        }
+        else if (index == 2)
         {
           std::size_t added = 0;
           std::string error;
@@ -11929,36 +12134,14 @@ void Launcher::GameModsSettings(Game* game)
                 std::array<std::string, 1>{error.empty() ? Tools::ResultMessage(result) : error});
           reload();
         }
-        else if (index == 1)
-        {
-          static constexpr std::array<std::string_view, 1> xml_extensions = {".xml"};
-          const std::string xml = FileBrowser(ParentPath(game->path), false, true, false,
-                                              xml_extensions, "Select Riivolution XML");
-          if (xml.empty())
-            return false;
-          const std::string descriptor =
-              File::GetUserPath(D_RIIVOLUTION_IDX) + "Presets/" + game->key + ".json";
-          std::string error;
-          const Tools::Result result = Tools::CreateRiivolutionPreset(
-              game->path, game->game_id, game->revision, xml, descriptor, &error);
-          if (result == Tools::Result::Success)
-          {
-            m_pending_launch = LaunchRequest{descriptor, game->game_id, game->revision};
-            m_pending_launch->game_config_path = game->config_override_path;
-            return true;
-          }
-          RenderMessage(
-              "Riivolution setup failed",
-              std::array<std::string, 1>{error.empty() ? Tools::ResultMessage(result) : error});
-        }
-        else if (index == 2)
+        else if (index == 3)
         {
           EditPerGameBool(*game, "Cheat engine", "Core", "EnableCheats",
                           Config::Get(Config::MAIN_ENABLE_CHEATS), delta, "Enabled", "Disabled");
         }
-        else
+        else if (index >= 5 && index - 5 < static_cast<int>(mods.size()))
         {
-          const Tools::ModEntry mod = mods[index - 3];
+          const Tools::ModEntry mod = mods[index - 5];
           std::string error;
           const Tools::Result result = Tools::SetGameModEnabled(
               game->game_id, game->revision, mod.type, mod.index, !mod.enabled, &error);
@@ -11974,15 +12157,29 @@ void Launcher::GameModsSettings(Game* game)
       },
       false,
       [&](int index) {
-        if (index == 2)
+        if (index == 0 || index == 1)
         {
-          SetGameSetting(*game, "Core", "EnableCheats", std::nullopt);
+          const bool saved = index == 0 ?
+                                 SetGameSetting(*game, "Riivolution", "Enabled", "False") :
+                                 SetGameSettings(*game, {{"Riivolution", "Preset", ""},
+                                                         {"Riivolution", "Enabled", "False"}});
+          if (saved && index == 1)
+          {
+            xml.clear();
+            descriptor = default_descriptor;
+          }
           game->has_game_config = RegularFileExists(GameIniPath(*game));
-          return true;
+          return saved;
         }
-        if (index < 3 || index - 3 >= static_cast<int>(mods.size()))
+        if (index == 3)
+        {
+          const bool saved = SetGameSetting(*game, "Core", "EnableCheats", std::nullopt);
+          game->has_game_config = RegularFileExists(GameIniPath(*game));
+          return saved;
+        }
+        if (index < 5 || index - 5 >= static_cast<int>(mods.size()))
           return false;
-        const Tools::ModEntry mod = mods[index - 3];
+        const Tools::ModEntry mod = mods[index - 5];
         std::string error;
         const Tools::Result result = Tools::SetGameModEnabled(game->game_id, game->revision,
                                                               mod.type, mod.index, false, &error);
@@ -11997,7 +12194,8 @@ void Launcher::GameModsSettings(Game* game)
           return false;
         }
         return true;
-      });
+      },
+      [](int index) { return index == 1; });
 }
 
 void Launcher::GCSaveManager(int slot)
@@ -15200,7 +15398,7 @@ void Launcher::RunBusyTask(std::string_view title, std::string_view detail,
   std::atomic<bool> complete{false};
   const std::string owned_title{title};
   const std::string owned_detail{detail};
-  (void)appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+  Common::HorizonClocks::ScopedCpuBoost boost;
   BusyTaskThreadContext context{&task, &complete, cancel};
   Thread worker{};
   const Result create_result =
@@ -15280,7 +15478,6 @@ void Launcher::RunBusyTask(std::string_view title, std::string_view detail,
     (void)threadWaitForExit(&worker);
     (void)threadClose(&worker);
   }
-  (void)appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
 }
 
 bool Launcher::ExecutePaste(const std::string& folder)
@@ -17414,17 +17611,7 @@ void Launcher::PerGameMenu(Game* game, bool* launch, bool* rescan)
       }
       else if (selection == 8)
       {
-        if (game->has_game_config)
-        {
-          std::remove(GameIniPath(*game).c_str());
-          InvalidateGameSettingCache(*game);
-          game->has_game_config = false;
-          Toast("Game settings cleared", 700);
-        }
-        else
-        {
-          Toast("No game settings found", 700);
-        }
+        ClearGameSettings(*game);
       }
       else
       {
@@ -18063,6 +18250,8 @@ std::optional<LaunchRequest> Launcher::Run()
   if (!selected_game)
     return std::nullopt;
   Game& game = *selected_game;
+  if (!RestoreRiivolutionProfile(game))
+    return std::nullopt;
   game.played = static_cast<std::int64_t>(std::time(nullptr));
   m_store.Set("Recent/" + game.key, std::to_string(game.played));
   MarkStoreDirty();

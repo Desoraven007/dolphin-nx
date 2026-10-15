@@ -105,7 +105,7 @@
   "Configures console language and video flags, Wii system options, the emulated SD card and GameCube expansion slots.": "Configura la lingua e i flag video della console, le opzioni di sistema Wii, la scheda SD emulata e gli slot di espansione GameCube.",
   "Configures four GameCube ports and four emulated Wii Remotes, including mappings, extensions, motion and rumble.": "Configura quattro porte GameCube e quattro telecomandi Wii emulati, incluse mappature, estensioni, movimento e vibrazione.",
   "Configures Wii networking, GameCube Broadband Adapter networking and NAND certificates used by online services.": "Configura la rete Wii, la rete del GameCube Broadband Adapter e i certificati NAND usati dai servizi online.",
-  "Manages Dolphin patches, Action Replay and Gecko codes, and launches the game with a Riivolution XML patch set.": "Gestisce le patch di Dolphin e i codici Action Replay e Gecko, e avvia il gioco con un set di patch XML Riivolution.",
+  "Manages Dolphin patches, Action Replay and Gecko codes, and the game's Riivolution patch settings.": "Gestisce le patch di Dolphin, i codici Action Replay e Gecko e le impostazioni delle patch Riivolution del gioco.",
   "Selects how Dolphin executes PowerPC code. JIT ARM64 is the normal high-performance choice; the interpreters are much slower and are mainly useful for diagnosis.": "Seleziona il modo in cui Dolphin esegue il codice PowerPC. JIT ARM64 è la normale scelta ad alte prestazioni; gli interpreti sono molto più lenti e servono soprattutto per la diagnosi.",
   "Runs the emulated CPU and GPU work on separate host threads. It usually improves performance, but a small number of games require it disabled for correct timing.": "Esegue il lavoro di CPU e GPU emulate su thread host separati. Di solito migliora le prestazioni, ma alcuni giochi richiedono che sia disattivato per una temporizzazione corretta.",
   "Allows enabled Action Replay, Gecko and patch codes to run. Individual codes are selected from the game's patches and cheats page.": "Consente l'esecuzione dei codici Action Replay, Gecko e patch abilitati. I singoli codici si selezionano dalla pagina delle patch e dei trucchi del gioco.",
@@ -243,7 +243,7 @@
   "Assigns the input used to recenter the gyro pointer's yaw and pitch during play.": "Assegna l'input usato per ricentrare imbardata e inclinazione del puntatore giroscopico durante il gioco.",
   "Shows the recommended procedure for learning gyroscope bias and keeping pointer input stable.": "Mostra la procedura consigliata per rilevare l'offset del giroscopio e mantenere stabile l'input del puntatore.",
   "Downloads available Gecko codes for this game from the configured online database and merges new entries into Dolphin's game configuration.": "Scarica dal database online configurato i codici Gecko disponibili per questo gioco e unisce le nuove voci alla configurazione di gioco di Dolphin.",
-  "Chooses a Riivolution XML patch definition and launches the game with its replacement files and options.": "Sceglie una definizione di patch XML Riivolution e avvia il gioco con i relativi file sostitutivi e opzioni.",
+  "Selects a Riivolution XML file and saves its replacement-file options for this game.": "Seleziona un file XML Riivolution e salva le opzioni di sostituzione dei file per questo gioco.",
   "Enables or disables Dolphin's patch, Action Replay and Gecko execution for this game.": "Abilita o disabilita per questo gioco l'esecuzione di patch, Action Replay e Gecko da parte di Dolphin.",
   "Changes the launcher's background and visual style. It has no effect on Dolphin's in-game renderer or performance.": "Cambia lo sfondo e lo stile visivo del launcher. Non influisce sul renderer di Dolphin durante il gioco né sulle prestazioni.",
   "Sets how many game covers appear across each library row. More columns make every cover smaller.": "Imposta quante copertine appaiono in ogni riga della libreria. Più colonne rendono ogni copertina più piccola.",
@@ -313,5 +313,12 @@
   "General": "Generale",
   "Preview unavailable": "Anteprima non disponibile",
   "Use artwork": "Usa immagine",
-  "Select": "Seleziona"
+  "Select": "Seleziona",
+  "Riivolution options": "Opzioni Riivolution",
+  "SD root": "Radice SD",
+  "Select mod root": "Seleziona la radice della mod",
+  "Select Riivolution XML": "Seleziona XML Riivolution",
+  "Riivolution XML": "XML Riivolution",
+  "Gecko codes": "Codici Gecko",
+  "Cheat codes": "Codici cheat"
 }

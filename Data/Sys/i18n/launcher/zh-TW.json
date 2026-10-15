@@ -191,7 +191,7 @@
   "IR total pitch": "IR 總俯仰",
   "IR total yaw": "IR 總偏航",
   "Joy-Con layout": "Joy-Con 配置",
-  "Launch with Riivolution XML": "使用 Riivolution XML 啟動",
+  "Riivolution XML": "Riivolution XML",
   "Launcher": "啟動器",
   "Load profile": "載入設定檔",
   "Lossless.dll": "Lossless.dll",
@@ -263,5 +263,13 @@
   "Favorites": "收藏",
   "Favorite": "收藏",
   "Use artwork": "使用封面",
-  "Select": "選擇"
+  "Select": "選擇",
+  "Riivolution options": "Riivolution 選項",
+  "SD root": "SD 卡根目錄",
+  "Select mod root": "選擇模組根目錄",
+  "Select Riivolution XML": "選擇 Riivolution XML",
+  "Gecko codes": "Gecko 代碼",
+  "Cheat codes": "作弊代碼",
+  "Selects a Riivolution XML file and saves its replacement-file options for this game.": "選擇 Riivolution XML 檔案並為此遊戲儲存檔案替換選項。",
+  "Manages Dolphin patches, Action Replay and Gecko codes, and the game's Riivolution patch settings.": "管理 Dolphin 修補程式、Action Replay 和 Gecko 代碼，以及遊戲的 Riivolution 修補設定。"
 }

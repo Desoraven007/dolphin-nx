@@ -3,10 +3,12 @@
 
 #pragma once
 
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "DiscIO/DirectoryBlob.h"
@@ -70,6 +72,10 @@ private:
 
   std::string m_sd_root;
   std::string m_patch_root;
+  mutable std::mutex m_cache_mutex;
+  mutable std::unordered_map<std::string, std::string> m_resolved_paths;
+  std::unordered_map<std::string, std::vector<Node>> m_folder_contents;
+  std::unordered_map<std::string, u64> m_folder_file_sizes;
 };
 
 enum class PatchIndex

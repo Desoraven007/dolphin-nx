@@ -104,7 +104,7 @@
   "Configures console language and video flags, Wii system options, the emulated SD card and GameCube expansion slots.": "Configura el idioma y los indicadores de vídeo de la consola, las opciones del sistema Wii, la tarjeta SD emulada y las ranuras de expansión de GameCube.",
   "Configures four GameCube ports and four emulated Wii Remotes, including mappings, extensions, motion and rumble.": "Configura cuatro puertos de GameCube y cuatro Wii Remotes emulados, incluidas las asignaciones, extensiones, movimiento y vibración.",
   "Configures Wii networking, GameCube Broadband Adapter networking and NAND certificates used by online services.": "Configura la red de Wii, la red del GameCube Broadband Adapter y los certificados NAND que usan los servicios en línea.",
-  "Manages Dolphin patches, Action Replay and Gecko codes, and launches the game with a Riivolution XML patch set.": "Gestiona los parches de Dolphin y los códigos Action Replay y Gecko, e inicia el juego con un conjunto de parches XML de Riivolution.",
+  "Manages Dolphin patches, Action Replay and Gecko codes, and the game's Riivolution patch settings.": "Gestiona los parches de Dolphin, los códigos Action Replay y Gecko y los ajustes de los parches de Riivolution del juego.",
 
   "Selects how Dolphin executes PowerPC code. JIT ARM64 is the normal high-performance choice; the interpreters are much slower and are mainly useful for diagnosis.": "Selecciona cómo ejecuta Dolphin el código PowerPC. JIT ARM64 es la opción habitual de alto rendimiento; los intérpretes son mucho más lentos y se usan principalmente para diagnóstico.",
   "Runs the emulated CPU and GPU work on separate host threads. It usually improves performance, but a small number of games require it disabled for correct timing.": "Ejecuta el trabajo de la CPU y la GPU emuladas en hilos separados del sistema anfitrión. Suele mejorar el rendimiento, pero unos pocos juegos necesitan que se desactive para mantener una temporización correcta.",
@@ -252,7 +252,7 @@
   "Shows the recommended procedure for learning gyroscope bias and keeping pointer input stable.": "Muestra el procedimiento recomendado para aprender el sesgo del giroscopio y mantener estable la entrada del puntero.",
 
   "Downloads available Gecko codes for this game from the configured online database and merges new entries into Dolphin's game configuration.": "Descarga los códigos Gecko disponibles para este juego desde la base de datos en línea configurada e incorpora las entradas nuevas a la configuración del juego de Dolphin.",
-  "Chooses a Riivolution XML patch definition and launches the game with its replacement files and options.": "Elige una definición de parche XML de Riivolution e inicia el juego con sus archivos de sustitución y opciones.",
+  "Selects a Riivolution XML file and saves its replacement-file options for this game.": "Selecciona un archivo XML de Riivolution y guarda sus opciones de reemplazo de archivos para este juego.",
   "Enables or disables Dolphin's patch, Action Replay and Gecko execution for this game.": "Activa o desactiva para este juego la ejecución de parches de Dolphin, Action Replay y Gecko.",
 
   "Changes the launcher's background and visual style. It has no effect on Dolphin's in-game renderer or performance.": "Cambia el fondo y el estilo visual del launcher. No afecta al renderizador de Dolphin durante el juego ni al rendimiento.",
@@ -323,5 +323,12 @@
   "General": "General",
   "Preview unavailable": "Vista previa no disponible",
   "Use artwork": "Usar ilustración",
-  "Select": "Seleccionar"
+  "Select": "Seleccionar",
+  "Riivolution options": "Opciones de Riivolution",
+  "SD root": "Raíz de la SD",
+  "Select mod root": "Seleccionar raíz del mod",
+  "Select Riivolution XML": "Seleccionar XML de Riivolution",
+  "Riivolution XML": "XML de Riivolution",
+  "Gecko codes": "Códigos Gecko",
+  "Cheat codes": "Códigos de trucos"
 }

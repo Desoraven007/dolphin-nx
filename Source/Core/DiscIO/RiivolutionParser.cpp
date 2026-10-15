@@ -342,6 +342,31 @@ std::vector<Patch> Disc::GeneratePatches(const std::string& game_id) const
   return active_patches;
 }
 
+void ApplyGameModDescriptorOptions(Disc* disc, const GameModDescriptorRiivolutionPatch& preset)
+{
+  for (auto& section : disc->m_sections)
+  {
+    for (auto& option : section.m_options)
+    {
+      const auto* info = [&]() -> const GameModDescriptorRiivolutionPatchOption* {
+        for (const auto& o : preset.options)
+        {
+          if (o.section_name == section.m_name)
+          {
+            if (!o.option_id.empty() && o.option_id == option.m_id)
+              return &o;
+            if (!o.option_name.empty() && o.option_name == option.m_name)
+              return &o;
+          }
+        }
+        return nullptr;
+      }();
+      if (info && info->choice <= option.m_choices.size())
+        option.m_selected_choice = info->choice;
+    }
+  }
+}
+
 std::vector<Patch> GenerateRiivolutionPatchesFromGameModDescriptor(
     const GameModDescriptorRiivolution& descriptor, const std::string& game_id,
     std::optional<u16> revision, std::optional<u8> disc_number)
@@ -352,29 +377,7 @@ std::vector<Patch> GenerateRiivolutionPatchesFromGameModDescriptor(
     auto parsed = ParseFile(patch_info.xml);
     if (!parsed || !parsed->IsValidForGame(game_id, revision, disc_number))
       continue;
-
-    for (auto& section : parsed->m_sections)
-    {
-      for (auto& option : section.m_options)
-      {
-        const auto* info = [&]() -> const GameModDescriptorRiivolutionPatchOption* {
-          for (const auto& o : patch_info.options)
-          {
-            if (o.section_name == section.m_name)
-            {
-              if (!o.option_id.empty() && o.option_id == option.m_id)
-                return &o;
-              if (!o.option_name.empty() && o.option_name == option.m_name)
-                return &o;
-            }
-          }
-          return nullptr;
-        }();
-        if (info && info->choice <= option.m_choices.size())
-          option.m_selected_choice = info->choice;
-      }
-    }
-
+    ApplyGameModDescriptorOptions(&*parsed, patch_info);
     for (auto& p : parsed->GeneratePatches(game_id))
     {
       p.m_file_data_loader =

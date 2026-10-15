@@ -5,12 +5,20 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "Common/CommonTypes.h"
 #include "DiscIO/Enums.h"
+
+namespace DiscIO::Riivolution
+{
+struct Disc;
+}
 
 namespace DolphinSwitch::Tools
 {
@@ -27,6 +35,10 @@ enum class Result
 };
 
 const char* ResultMessage(Result result);
+
+Result ClearGameSettings(const std::string& game_id, u16 revision,
+                         std::span<const std::string_view> entry_keys, std::size_t* removed,
+                         std::string* error = nullptr);
 
 enum class ModType
 {
@@ -134,7 +146,9 @@ struct WiiNetworkStatus
 WiiNetworkStatus GetWiiNetworkStatus();
 Result ResetWiiNetworkConfiguration(std::string* error = nullptr);
 
-Result CreateRiivolutionPreset(const std::string& base_game_path, const std::string& game_id,
-                               u16 revision, const std::string& xml_path,
-                               const std::string& output_path, std::string* error = nullptr);
+Result CreateRiivolutionPreset(
+    const std::string& base_game_path, const std::string& game_id, u16 revision, u8 disc_number,
+    const std::string& xml_path, const std::string& output_path,
+    const std::function<bool(DiscIO::Riivolution::Disc&, std::string&)>& configure,
+    std::string* error = nullptr);
 }  // namespace DolphinSwitch::Tools

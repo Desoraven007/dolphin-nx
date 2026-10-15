@@ -52,6 +52,7 @@ FileDataLoaderHostFS::FileDataLoaderHostFS(std::string sd_root, const std::strin
     if (r)
       m_patch_root = std::move(*r);
   }
+  m_resolved_paths.clear();
 }
 
 std::optional<std::string>
@@ -64,6 +65,7 @@ FileDataLoaderHostFS::MakeAbsoluteFromRelative(std::string_view external_relativ
     return std::nullopt;
 #endif
 
+  std::lock_guard lock(m_cache_mutex);
   const std::string& root = external_relative_path.starts_with('/') ? m_sd_root : m_patch_root;
   std::string result = root;
   std::string_view work = external_relative_path;
@@ -122,7 +124,12 @@ FileDataLoaderHostFS::MakeAbsoluteFromRelative(std::string_view external_relativ
       // file references a 'file.bin' but the actual file is named 'File.bin' or 'FILE.BIN'. To
       // preserve this behavior, we modify the file path to match any existing file in the file
       // system, if one exists.
-      if (!::File::Exists(result))
+      const auto cached = m_resolved_paths.find(result);
+      if (cached != m_resolved_paths.end())
+      {
+        result = cached->second;
+      }
+      else if (!::File::Exists(result))
       {
         // Drop path element again so we can search in the directory.
         result.erase(result.size() - element.size(), element.size());
@@ -134,6 +141,7 @@ FileDataLoaderHostFS::MakeAbsoluteFromRelative(std::string_view external_relativ
         {
           if (Common::CaseInsensitiveEquals(element, f.virtualName))
           {
+            m_resolved_paths.emplace(result + std::string(element), result + f.virtualName);
             result += f.virtualName;
             found = true;
             break;
@@ -143,6 +151,10 @@ FileDataLoaderHostFS::MakeAbsoluteFromRelative(std::string_view external_relativ
         // If there isn't any file that matches just use the given element.
         if (!found)
           result += element;
+      }
+      else
+      {
+        m_resolved_paths.emplace(result, result);
       }
     }
 
@@ -165,10 +177,20 @@ FileDataLoaderHostFS::GetExternalFileSize(std::string_view external_relative_pat
 {
   auto path = MakeAbsoluteFromRelative(external_relative_path);
   if (!path)
+  {
     return std::nullopt;
+  }
+  {
+    std::lock_guard lock(m_cache_mutex);
+    const auto cached = m_folder_file_sizes.find(*path);
+    if (cached != m_folder_file_sizes.end())
+      return cached->second;
+  }
   ::File::FileInfo f(*path);
   if (!f.IsFile())
+  {
     return std::nullopt;
+  }
   return f.GetSize();
 }
 
@@ -179,12 +201,16 @@ std::vector<u8> FileDataLoaderHostFS::GetFileContents(std::string_view external_
     return {};
   ::File::IOFile f(*path, "rb");
   if (!f)
+  {
     return {};
+  }
   const u64 length = f.GetSize();
   std::vector<u8> value;
   value.resize(length);
   if (!f.ReadBytes(value.data(), length))
+  {
     return {};
+  }
   return value;
 }
 
@@ -194,11 +220,29 @@ FileDataLoaderHostFS::GetFolderContents(std::string_view external_relative_path)
   auto path = MakeAbsoluteFromRelative(external_relative_path);
   if (!path)
     return {};
+  {
+    std::lock_guard lock(m_cache_mutex);
+    const auto cached = m_folder_contents.find(*path);
+    if (cached != m_folder_contents.end())
+      return cached->second;
+  }
+  if (!::File::IsDirectory(*path))
+  {
+    return {};
+  }
   ::File::FSTEntry external_files = ::File::ScanDirectoryTree(*path, false);
   std::vector<FileDataLoader::Node> nodes;
   nodes.reserve(external_files.children.size());
+  std::lock_guard lock(m_cache_mutex);
   for (auto& file : external_files.children)
+  {
+    const std::string child_path = *path + "/" + file.virtualName;
+    m_resolved_paths.emplace(child_path, child_path);
+    if (!file.isDirectory)
+      m_folder_file_sizes.emplace(child_path, file.size);
     nodes.emplace_back(FileDataLoader::Node{std::move(file.virtualName), file.isDirectory});
+  }
+  m_folder_contents.emplace(*path, nodes);
   return nodes;
 }
 
@@ -418,26 +462,24 @@ static FSTBuilderNode* FindFilenameNodeInFST(std::string_view filename,
 static void ApplyFilePatchToFST(const Patch& patch, const File& file,
                                 std::vector<FSTBuilderNode>* fst, FSTBuilderNode* dol_node)
 {
+  FSTBuilderNode* node = nullptr;
   if (!file.m_disc.empty() && file.m_disc[0] == '/')
   {
     // If the disc path starts with a / then we should patch that specific disc path.
-    FSTBuilderNode* node =
-        FindFileNodeInFST(std::string_view(file.m_disc).substr(1), fst, file.m_create);
-    if (node)
-      ApplyPatchToFile(patch, file, node);
+    node = FindFileNodeInFST(std::string_view(file.m_disc).substr(1), fst, file.m_create);
   }
   else if (dol_node && Common::CaseInsensitiveEquals(file.m_disc, "main.dol"))
   {
     // Special case: If the filename is "main.dol", we want to patch the main executable.
-    ApplyPatchToFile(patch, file, dol_node);
+    node = dol_node;
   }
   else
   {
     // Otherwise we want to patch the first file in the FST that matches that filename.
-    FSTBuilderNode* node = FindFilenameNodeInFST(file.m_disc, *fst);
-    if (node)
-      ApplyPatchToFile(patch, file, node);
+    node = FindFilenameNodeInFST(file.m_disc, *fst);
   }
+  if (node)
+    ApplyPatchToFile(patch, file, node);
 }
 
 static void ApplyFolderPatchToFST(const Patch& patch, const Folder& folder,
@@ -519,18 +561,29 @@ static void ApplyMemoryPatch(const Core::CPUThreadGuard& guard, u32 offset,
                              std::span<const u8> value, std::span<const u8> original)
 {
   if (AchievementManager::GetInstance().IsHardcoreModeActive())
+  {
     return;
+  }
 
   if (value.empty())
+  {
     return;
+  }
 
   if (!original.empty() && !MemoryMatchesAt(guard, offset, original))
+  {
     return;
+  }
 
   auto& system = guard.GetSystem();
   const u32 size = static_cast<u32>(value.size());
   for (u32 i = 0; i < size; ++i)
-    PowerPC::MMU::HostTryWrite<u8>(guard, value[i], offset + i);
+  {
+    if (!PowerPC::MMU::HostTryWrite<u8>(guard, value[i], offset + i))
+    {
+      return;
+    }
+  }
   const u32 overlapping_hook_count = HLE::UnpatchRange(system, offset, offset + size);
   if (overlapping_hook_count != 0)
   {
@@ -600,7 +653,10 @@ static void ApplyOcarinaMemoryPatch(const Core::CPUThreadGuard& guard, const Pat
           // and replace it with a jump to the given offset
           const u32 target = memory_patch.m_offset | 0x80000000;
           const u32 jmp = ((target - blr_address) & 0x03fffffc) | 0x48000000;
-          PowerPC::MMU::HostTryWrite<u32>(guard, jmp, blr_address);
+          if (!PowerPC::MMU::HostTryWrite<u32>(guard, jmp, blr_address))
+          {
+            return;
+          }
           const u32 overlapping_hook_count =
               HLE::UnpatchRange(system, blr_address, blr_address + 4);
           if (overlapping_hook_count != 0)

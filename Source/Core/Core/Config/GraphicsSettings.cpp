@@ -112,7 +112,7 @@ const Info<bool> GFX_WAIT_FOR_SHADERS_BEFORE_STARTING{
 const Info<ShaderCompilationMode> GFX_SHADER_COMPILATION_MODE{
     {System::GFX, "Settings", "ShaderCompilationMode"},
 #ifdef __SWITCH__
-    ShaderCompilationMode::AsynchronousUberShaders};
+    ShaderCompilationMode::AsynchronousSkipRendering};
 #else
     ShaderCompilationMode::Synchronous};
 #endif

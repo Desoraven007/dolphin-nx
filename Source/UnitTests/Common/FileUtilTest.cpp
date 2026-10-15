@@ -172,6 +172,10 @@ TEST_F(FileUtilTest, DirectIOFile)
   // Everything fails when a file isn't open.
   EXPECT_FALSE(file.Write(u8_buffer));
   EXPECT_FALSE(file.Read(u8_buffer));
+  EXPECT_FALSE(file.OffsetRead(0, u8_buffer.data(), u8_buffer.size()));
+  EXPECT_FALSE(file.OffsetWrite(0, u8_buffer.data(), u8_buffer.size()));
+  EXPECT_FALSE(file.OffsetRead(0, u8_buffer.data(), 0));
+  EXPECT_FALSE(file.OffsetWrite(0, u8_buffer.data(), 0));
   EXPECT_FALSE(file.Flush());
   EXPECT_FALSE(file.Seek(12, File::SeekOrigin::Begin));
   EXPECT_EQ(file.Tell(), 0);

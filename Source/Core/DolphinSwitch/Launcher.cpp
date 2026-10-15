@@ -91,6 +91,7 @@ constexpr std::string_view CONFIG_PATH = "sdmc:/switch/dolphin/launcher.ini";
 constexpr std::string_view COVER_DIRECTORY = "sdmc:/switch/dolphin/covers";
 constexpr std::string_view LSFG_DIRECTORY = "sdmc:/switch/dolphin/lsfg";
 constexpr int COVER_CACHE_LIMIT = 64;
+constexpr int BACKGROUND_CACHE_LIMIT = 4;
 constexpr int COVER_REQUEST_BUDGET = 48;
 constexpr int COVER_UPLOAD_BUDGET = 2;
 constexpr std::size_t COVER_JOB_LIMIT = 96;
@@ -104,19 +105,15 @@ constexpr std::size_t BUSY_TASK_STACK_SIZE = 2 * 1024 * 1024;
 // SDL's B button is the physical A button on Switch.
 constexpr SDL_GameControllerButton BUTTON_CONFIRM = SDL_CONTROLLER_BUTTON_B;
 constexpr SDL_GameControllerButton BUTTON_CANCEL = SDL_CONTROLLER_BUTTON_A;
-constexpr SDL_GameControllerButton BUTTON_SETTINGS = SDL_CONTROLLER_BUTTON_Y;
+constexpr SDL_GameControllerButton BUTTON_X = SDL_CONTROLLER_BUTTON_Y;
+constexpr SDL_GameControllerButton BUTTON_Y = SDL_CONTROLLER_BUTTON_X;
 
 // Button glyphs are rendered at three times their display size and downscaled when blitted.
 constexpr int GLYPH_SUPERSAMPLE = 3;
 
-constexpr std::array<std::pair<std::string_view, std::string_view>, 8> LIBRARY_FOOTER = {{
+constexpr std::array<std::pair<std::string_view, std::string_view>, 3> LIBRARY_FOOTER = {{
     {"A", "Launch"},
-    {"Y", "Sort"},
-    {"X", "Settings"},
-    {"+", "Game Menu"},
-    {"-", "Filter"},
-    {"L", ""},
-    {"R", "Page"},
+    {"Y", "Game Menu"},
     {"B", "Quit"},
 }};
 
@@ -127,7 +124,7 @@ constexpr std::array<std::string_view, GAME_MENU_COUNT> GAME_MENU_ITEMS = {
     "Launch",
     "Game settings",
     "Rename game",
-    "Favorite / collections",
+    "Favorite",
     "Cover settings",
     "Create HOME shortcut",
     "Manage installed content",
@@ -843,18 +840,34 @@ std::string StableIdStem(std::string_view game_id, std::string_view fingerprint)
 
 enum class Theme
 {
-  Xmb,
-  Bubbles,
-  Glow,
+  Wii,
   Classic,
-  Oled,
 };
 
-enum class SortMode
+enum class LibraryView
 {
-  Alphabetical,
-  RecentlyPlayed,
-  RecentlyAdded,
+  Recent,
+  All,
+  Favorites,
+};
+
+enum class LibraryIcon
+{
+  Recent,
+  Games,
+  Favorite,
+  Settings,
+};
+
+struct LibraryHeaderLayout
+{
+  std::array<SDL_Rect, 3> tabs;
+  SDL_Rect settings;
+};
+
+struct RecentLayout
+{
+  int x, y, focused_width, width, title_y;
 };
 
 struct Game
@@ -878,11 +891,9 @@ struct Game
   std::string config_override_path;
   std::uint64_t title_id = 0;
   std::uint16_t revision = 0;
-  std::int64_t modified = 0;
   std::int64_t played = 0;
   DiscIO::Region region = DiscIO::Region::Unknown;
   bool has_game_config = false;
-  bool has_custom_title = false;
   bool installed_nand = false;
   bool allow_legacy_path_migration = true;
   // True when GameFileCache rebuilt this entry because its source/dependencies changed.  The
@@ -895,7 +906,21 @@ struct Game
   Uint32 cover_loaded_at = 0;
   bool cover_attempted = false;
   bool cover_queued = false;
+  SDL_Texture* background = nullptr;
+  std::uint64_t background_use = 0;
+  std::uint64_t background_request = 0;
+  bool background_attempted = false;
+  bool background_queued = false;
 };
+
+void ReleaseGameArtwork(Game& game)
+{
+  if (game.cover)
+    SDL_DestroyTexture(game.cover);
+  if (game.background)
+    SDL_DestroyTexture(game.background);
+  game.cover = game.background = nullptr;
+}
 
 struct LibraryIdentityRecord
 {
@@ -960,12 +985,6 @@ std::string LibraryIdentityScope(std::string_view canonical_path)
   return colon == std::string::npos ? std::string{} : canonical.substr(0, colon + 1);
 }
 
-struct Collection
-{
-  std::string name;
-  std::unordered_set<std::string> members;
-};
-
 struct LibraryScanState
 {
   std::atomic_bool cancel{false};
@@ -984,6 +1003,7 @@ struct CoverDecodeJob
 {
   std::string key;
   std::string custom_path;
+  bool background = false;
   std::shared_ptr<const UICommon::GameFile> metadata;
   std::uint64_t request = 0;
   std::uint64_t epoch = 0;
@@ -992,6 +1012,7 @@ struct CoverDecodeJob
 struct CoverDecodeResult
 {
   std::string key;
+  bool background = false;
   std::uint64_t request = 0;
   std::uint64_t epoch = 0;
   int width = 0;
@@ -1129,7 +1150,7 @@ static constexpr SettingHelpEntry SETTING_HELP[] = {
      "title-specific timing adjustment."},
 
     {"Video backend", "Graphics backend",
-     "Selects the renderer for the next game, globally or per game. Vulkan (NVK) is the default. "
+     "Selects the renderer for the next game, globally or per game. Deko3D is the default. "
      "OpenGL offers NVC0 or Zink; Deko3D uses its own native renderer."},
     {"GLThread", "OpenGL command threading",
      "Lets Mesa build OpenGL command streams on a worker thread. It can improve CPU-limited "
@@ -1506,8 +1527,7 @@ static constexpr SettingHelpEntry SETTING_HELP[] = {
      "Edits the API key used to search and download SteamGridDB covers and shortcut icons. Leave "
      "it blank to remove the saved key."},
     {"Download from SteamGridDB", "Artwork service",
-     "Searches SteamGridDB for this game and replaces its custom cover with the selected online "
-     "artwork."},
+     "Choose a game cover, then select optional background artwork for the Classic theme."},
     {"Import cover from file", "Local artwork",
      "Imports a PNG, JPEG, WebP or BMP image from SD, USB or SMB storage and stores it as this "
      "game's custom cover."},
@@ -1797,28 +1817,24 @@ private:
   std::string GameBaseIdentity(const UICommon::GameFile& metadata) const;
   void AssignStableIdentity(Game* game);
   void MigrateLegacyGameState(Game* game);
-  void LoadLibraryOrganization();
-  void SaveCollections();
+  void LoadFavorites();
+  void SaveFavorites();
   void RebuildVisibleGames();
   Game* VisibleGame(int index);
   void StartGameScan(std::vector<std::string> sources, bool replace);
   void StopGameScan();
   void PumpGameScan();
   void ScanGames();
-  [[maybe_unused]] void ScanGamesLegacy();
   void SortGames();
 
   void ConfigureLauncherScale();
   int FontMetric(int pixels) const;
   int FontHeight(TTF_Font* font) const;
   void ClearBackground();
-  void DrawBubbles(float time);
-  void DrawXmb(float time);
-  void DrawXmbRibbon(float time, float center, float amplitude, float frequency, float slope,
-                     float phase, int half_width, SDL_Color color);
-  void DrawXmbFilament(float time, float center, float amplitude, float frequency, float slope,
-                       float phase, SDL_Color color);
-  void DrawXmbSparkles(float time);
+  void DrawWiiBackground(float time);
+  void DrawClassicBackground();
+  void DrawBackgroundArtwork(const std::string& key, Uint8 alpha);
+  void DrawGradient(const SDL_Rect& rect, SDL_Color first, SDL_Color last, bool horizontal = false);
   void EnsureGlowTexture();
   bool HasAnimatedBackground() const;
   SDL_FRect PixelAlignedRect(int x, int y, int width, int height) const;
@@ -1875,7 +1891,7 @@ private:
   GameMenuLayout ComputeGameMenuLayout() const;
   void DrawGameMenu(Game* game, int selection);
   FooterLayout MeasureFooter(std::span<const std::pair<std::string_view, std::string_view>> hints);
-  void DrawFooterBand(int height);
+  void DrawLauncherMark(int center_y);
   void DrawFooter(std::span<const std::pair<std::string_view, std::string_view>> hints,
                   int center_y = -1);
   bool PressFooterButton(int x, int y);
@@ -1925,14 +1941,32 @@ private:
   void StartCoverDecodeWorker();
   void StopCoverDecodeWorker();
   void CancelQueuedCoverDecodes();
-  void QueueCoverDecode(Game* game, bool priority);
+  void QueueCoverDecode(Game* game, bool priority, bool background = false);
   void PumpCoverDecodeResults();
   SDL_Texture* UploadCoverTexture(const CoverDecodeResult& result);
-  SDL_Texture* LoadScaledTexture(const std::string& path, int width, int height);
+  SDL_Texture* LoadScaledTexture(const std::string& path, int width, int height,
+                                 bool preserve_aspect = false);
   void EnsureCover(Game* game, bool priority = false);
   void ReloadCover(Game* game);
+  void ReloadBackground(Game* game);
+  void InstallBackground(Game* game, SDL_Texture* texture);
   void EvictCover();
   std::string CoverPath(const Game& game) const;
+  std::string BackgroundPath(const Game& game) const;
+  std::string ArtworkKey(const Game& game, std::string_view field) const;
+  Game* FindGameByKey(std::string_view key);
+  int VisibleIndexForKey(std::string_view key) const;
+  void SelectLibraryTab(int tab, int* selection);
+  std::string LibraryTabLabel(int tab);
+  LibraryHeaderLayout ComputeLibraryHeaderLayout();
+  int LibraryHeaderHit(int x, int y);
+  void DrawLibraryIcon(LibraryIcon icon, int center_x, int center_y, int size, SDL_Color color);
+  void DrawLibraryHeader();
+  RecentLayout ComputeRecentLayout() const;
+  SDL_Rect RecentCoverRect(int index, const RecentLayout& layout) const;
+  SDL_Rect LibraryEmptyActionRect() const;
+  void DrawLibraryEmpty();
+  void DrawLibraryCover(Game& game, const SDL_Rect& rect, bool selected);
   void RenderGrid(int selection);
   int GridColumns() const;
   int GridRows() const;
@@ -1940,7 +1974,7 @@ private:
   int GridNavigate(int selection, int dx, int dy) const;
   int GridPage(int selection, int direction) const;
   GridLayout ComputeGridLayout();
-  int GridHitTest(int x, int y, int page_start);
+  int GridHitTest(int x, int y, int page_start, int selection);
 
   void SettingsRoot();
   void PerGameSettingsRoot(Game* game);
@@ -1995,9 +2029,6 @@ private:
   void PollUpdateNotification();
   void DrawUpdateNotification();
   void LibrarySettings();
-  void LibraryFilterMenu();
-  void ManageCollections();
-  void EditGameOrganization(Game* game);
   void DownloadCovers();
   bool EjectUsbLocation(std::string_view stable_id);
   void GameSourcesScreen();
@@ -2012,7 +2043,7 @@ private:
   void ImportCoverFromFile(Game* game);
   void DownloadCover(Game* game);
   int ChooseCoverArtwork(const std::vector<CoverDownload::Artwork>& artwork,
-                         std::string_view game_name);
+                         std::string_view game_name, bool background = false);
 
   bool DeleteTree(const std::string& path, const std::atomic_bool* cancel = nullptr);
   bool MeasureTree(const std::string& path, TransferState* state);
@@ -2027,7 +2058,6 @@ private:
   void ReplaceSavedPathPrefix(const std::string& old_path, const std::string& new_path);
   void RemoveSavedPathsBelow(const std::string& root);
   void EnsureSourceMountedAtStartup(const std::string& path);
-  std::string GameLocationLabel(const Game& game) const;
 
   std::string SharedGameIniPath(const Game& game) const;
   std::string EntryGameIniPath(const Game& game) const;
@@ -2042,8 +2072,6 @@ private:
                       std::tuple<std::string_view, std::string_view, std::optional<std::string>>>
                       edits);
   void InvalidateGameSettingCache(const Game& game) const;
-  std::string GlobalValueLabel(std::string_view value) const;
-  std::string UseGlobalValueLabel(std::string_view value) const;
   std::string PerGameBoolLabel(const Game& game, std::string_view section, std::string_view key,
                                bool global, bool inverted = false) const;
   void EditPerGameBool(Game& game, std::string_view title, std::string_view section,
@@ -2064,9 +2092,16 @@ private:
   // renamed image cannot steal their IDs through the fingerprint fallback.
   std::unordered_set<std::string> m_reserved_library_ids;
   std::unordered_set<std::string> m_favorites;
-  std::vector<Collection> m_collections;
-  std::string m_search_query;
-  std::string m_active_collection;
+  LibraryView m_library_view = LibraryView::Recent;
+  bool m_library_header_focused = false;
+  int m_library_header_selection = 0;
+  std::array<float, 3> m_library_tab_open{1, 0, 0};
+  Uint32 m_library_animation_tick = 0;
+  float m_recent_position = -1;
+  std::array<std::string, 3> m_library_selections;
+  std::array<bool, 2> m_library_triggers{};
+  std::string m_background_target, m_background_current, m_background_previous;
+  Uint32 m_background_since = 0;
   std::vector<Storage::Location> m_usb_locations;
   // Keyed by the normalized current source path; value is {stable device id, path on device}.
   std::unordered_map<std::string, std::pair<std::string, std::string>> m_usb_source_bindings;
@@ -2089,10 +2124,12 @@ private:
   TTF_Font* m_font = nullptr;
   TTF_Font* m_font_large = nullptr;
   TTF_Font* m_font_caption = nullptr;
+  TTF_Font* m_font_hint = nullptr;
   SDL_Texture* m_logo = nullptr;
   SDL_Texture* m_glow = nullptr;
   SDL_Texture* m_round_texture = nullptr;
-  std::array<SDL_Texture*, 10> m_glyphs{};
+  SDL_Texture* m_settings_icon = nullptr;
+  std::array<SDL_Texture*, 7> m_glyphs{};
   std::array<SDL_Texture*, 4> m_flags{};
   bool m_sdl_ready = false;
   bool m_ttf_ready = false;
@@ -2113,8 +2150,7 @@ private:
   float m_ui_scale = 1.0f;
   float m_font_scale = 1.0f;
   bool m_present_vsync = false;
-  Theme m_theme = Theme::Bubbles;
-  SortMode m_sort_mode = SortMode::Alphabetical;
+  Theme m_theme = Theme::Wii;
   bool m_animations = true;
   bool m_show_titles = true;
   bool m_show_region_flags = true;
@@ -2188,7 +2224,7 @@ void Launcher::LoadDefaults()
   if (!m_store.Get("Launcher/Initialized").empty())
     return;
   m_store.Set("Launcher/Initialized", "1");
-  m_store.Set("Launcher/Theme", "bubbles");
+  m_store.Set("Launcher/Theme", "wii");
   m_store.Set("Launcher/Language", "system");
   m_store.SetBool("Launcher/Animations", true);
   m_store.SetBool("Launcher/Sounds", true);
@@ -2199,7 +2235,6 @@ void Launcher::LoadDefaults()
   m_store.Set("Launcher/InstalledReleaseTag", Updater::BuiltReleaseTag());
   m_store.SetInt("Launcher/GridColumns", 5);
   m_store.SetInt("Launcher/GridRows", 2);
-  m_store.SetInt("Launcher/SortMode", 0);
   m_store.Set("Network/SteamGridDBKey", "");
   m_sources.clear();
   SaveSources();
@@ -2273,12 +2308,15 @@ bool Launcher::LoadFonts()
                                    static_cast<int>(std::lround(size * m_ui_scale))) :
                     nullptr;
   };
+  TTF_Font* const hint = open_font(18);
   TTF_Font* const caption = open_font(14);
   TTF_Font* const small = open_font(20);
   TTF_Font* const normal = open_font(26);
   TTF_Font* const large_font = open_font(32);
-  if (!caption || !small || !normal || !large_font)
+  if (!hint || !caption || !small || !normal || !large_font)
   {
+    if (hint)
+      TTF_CloseFont(hint);
     if (caption)
       TTF_CloseFont(caption);
     if (small)
@@ -2291,6 +2329,8 @@ bool Launcher::LoadFonts()
   }
 
   ClearTextCaches();
+  if (m_font_hint)
+    TTF_CloseFont(m_font_hint);
   if (m_font_caption)
     TTF_CloseFont(m_font_caption);
   if (m_font_small)
@@ -2301,6 +2341,7 @@ bool Launcher::LoadFonts()
     TTF_CloseFont(m_font_large);
   m_font_scale = m_ui_scale;
   m_font_caption = caption;
+  m_font_hint = hint;
   m_font_small = small;
   m_font = normal;
   m_font_large = large_font;
@@ -2464,9 +2505,7 @@ void Launcher::Shutdown()
 
   for (Game& game : m_games)
   {
-    if (game.cover)
-      SDL_DestroyTexture(game.cover);
-    game.cover = nullptr;
+    ReleaseGameArtwork(game);
   }
   for (auto& [key, value] : m_text_cache)
     SDL_DestroyTexture(value.texture);
@@ -2487,6 +2526,8 @@ void Launcher::Shutdown()
   m_games.clear();
   m_game_cache.Clear(UICommon::GameFileCache::DeleteOnDisk::No);
 
+  if (m_font_hint)
+    TTF_CloseFont(m_font_hint);
   if (m_font_caption)
     TTF_CloseFont(m_font_caption);
   if (m_font_small)
@@ -2495,7 +2536,7 @@ void Launcher::Shutdown()
     TTF_CloseFont(m_font);
   if (m_font_large)
     TTF_CloseFont(m_font_large);
-  m_font_small = m_font = m_font_large = m_font_caption = nullptr;
+  m_font_small = m_font = m_font_large = m_font_caption = m_font_hint = nullptr;
   if (m_font_service_ready)
     plExit();
   m_font_service_ready = false;
@@ -2546,9 +2587,6 @@ void Launcher::PrepareApplicationExit()
     return;
   m_application_exit_prepared = true;
 
-  // Keep presenting a real frame while cancellable scan/network workers drain. A saved custom
-  // collection can become interactive long before a full-library scan is finished; immediately
-  // blocking in join() in that state made the Switch compositor fall back to a black frame.
   const auto render_closing = [&] {
     ClearBackground();
     DrawHeader("Dolphin");
@@ -2610,56 +2648,21 @@ Launcher::~Launcher()
 void Launcher::ApplyAppearance()
 {
   const Theme previous_theme = m_theme;
-  const std::string theme = Lower(m_store.Get("Launcher/Theme", "bubbles"));
-  m_theme = theme == "xmb"     ? Theme::Xmb :
-            theme == "glow"    ? Theme::Glow :
-            theme == "classic" ? Theme::Classic :
-            theme == "oled"    ? Theme::Oled :
-                                 Theme::Bubbles;
+  const std::string theme = Lower(m_store.Get("Launcher/Theme", "wii"));
+  m_theme = theme == "classic" ? Theme::Classic : Theme::Wii;
+  const std::string normalized = m_theme == Theme::Classic ? "classic" : "wii";
+  if (m_store.Get("Launcher/Theme") != normalized)
+  {
+    m_store.Set("Launcher/Theme", normalized);
+    MarkStoreDirty();
+  }
   m_animations = m_store.GetBool("Launcher/Animations", true);
   m_show_titles = m_store.GetBool("Launcher/ShowTitles", true);
   m_show_region_flags = m_store.GetBool("Launcher/ShowRegionFlags", true);
   m_show_custom_settings_badges = m_store.GetBool("Launcher/ShowCustomSettingsBadges", true);
   m_grid_columns = std::clamp(m_store.GetInt("Launcher/GridColumns", 5), 3, 8);
   m_grid_rows = std::clamp(m_store.GetInt("Launcher/GridRows", 2), 1, 3);
-  m_sort_mode = static_cast<SortMode>(std::clamp(m_store.GetInt("Launcher/SortMode", 0), 0, 2));
-  if (m_theme == Theme::Xmb)
-  {
-    m_background = {8, 51, 104, 255};
-    m_text = {242, 247, 255, 255};
-    m_dim = {180, 204, 227, 255};
-    m_highlight = {137, 225, 255, 255};
-    m_value = {245, 252, 255, 255};
-    m_selection = {118, 213, 255, 255};
-    m_panel = {10, 43, 81, 255};
-    m_card = {12, 48, 85, 196};
-    m_focus = {22, 75, 119, 255};
-  }
-  else if (m_theme == Theme::Classic)
-  {
-    m_background = {22, 24, 30, 255};
-    m_text = {228, 230, 235, 255};
-    m_dim = {150, 155, 165, 255};
-    m_highlight = {96, 200, 255, 255};
-    m_value = {255, 210, 100, 255};
-    m_selection = {255, 170, 0, 255};
-    m_panel = {28, 31, 40, 255};
-    m_card = {24, 26, 34, 255};
-    m_focus = {66, 56, 30, 255};
-  }
-  else if (m_theme == Theme::Oled)
-  {
-    m_background = {0, 0, 0, 255};
-    m_text = {245, 247, 249, 255};
-    m_dim = {145, 151, 158, 255};
-    m_highlight = {105, 220, 255, 255};
-    m_value = {255, 255, 255, 255};
-    m_selection = {0, 210, 190, 255};
-    m_panel = {4, 4, 5, 255};
-    m_card = {8, 8, 10, 250};
-    m_focus = {0, 58, 53, 255};
-  }
-  else if (m_theme == Theme::Glow)
+  if (m_theme == Theme::Classic)
   {
     m_background = {8, 12, 24, 255};
     m_text = {235, 239, 247, 255};
@@ -2684,15 +2687,7 @@ void Launcher::ApplyAppearance()
     m_focus = {17, 133, 169, 255};
   }
   if (previous_theme != m_theme && m_renderer)
-  {
-    for (auto& [key, value] : m_text_cache)
-      SDL_DestroyTexture(value.texture);
-    m_text_cache.clear();
-    m_metric_cache.clear();
-    m_ellipsis_cache.clear();
-    m_text_cache_bytes = 0;
-    m_text_use = 0;
-  }
+    ClearTextCaches();
 }
 
 SDL_FRect Launcher::PixelAlignedRect(int x, int y, int width, int height) const
@@ -2784,7 +2779,7 @@ void Launcher::Border(int x, int y, int width, int height, int thickness, SDL_Co
 
 bool Launcher::HasAnimatedBackground() const
 {
-  return m_theme == Theme::Xmb || m_theme == Theme::Bubbles || m_theme == Theme::Glow;
+  return m_theme == Theme::Wii;
 }
 
 void Launcher::FillCircle(int center_x, int center_y, int radius, SDL_Color color)
@@ -2837,7 +2832,7 @@ SDL_Texture* Launcher::MakeGlyph(std::string_view label, bool pill)
   if (!m_font_small || !m_font_large)
     return nullptr;
   constexpr int supersample = GLYPH_SUPERSAMPLE;
-  const int base = FontHeight(m_font_small) + 6;
+  constexpr int base = 26;
   const int height = base * supersample;
   const int width = (pill ? base * 8 / 5 : base) * supersample;
   SDL_Texture* texture = SDL_CreateTexture(m_renderer, SDL_PIXELFORMAT_RGBA8888,
@@ -2854,32 +2849,10 @@ SDL_Texture* Launcher::MakeGlyph(std::string_view label, bool pill)
   SDL_RenderSetScale(m_renderer, 1.0f, 1.0f);
   SDL_SetRenderDrawColor(m_renderer, 0, 0, 0, 0);
   SDL_RenderClear(m_renderer);
-  const SDL_Color edge{14, 16, 22, 255};
-  const SDL_Color rim{92, 99, 114, 255};
-  const SDL_Color face{52, 57, 68, 255};
-  if (pill)
-  {
-    const int radius = height / 2;
-    FillCircle(radius, radius, radius, edge);
-    FillCircle(width - radius, radius, radius, edge);
-    FillRect(radius, 0, width - radius * 2, height, edge);
-    FillCircle(radius, radius, radius - supersample, rim);
-    FillCircle(width - radius, radius, radius - supersample, rim);
-    FillRect(radius, supersample, width - radius * 2, height - supersample * 2, rim);
-    FillCircle(radius, radius, radius - supersample * 2, face);
-    FillCircle(width - radius, radius, radius - supersample * 2, face);
-    FillRect(radius, supersample * 2, width - radius * 2, height - supersample * 4, face);
-  }
-  else
-  {
-    const int radius = height / 2;
-    FillCircle(width / 2, height / 2, radius, edge);
-    FillCircle(width / 2, height / 2, radius - supersample, rim);
-    FillCircle(width / 2, height / 2, radius - supersample * 2, face);
-  }
+  RoundedRect(0, 0, width, height, height / 2, SDL_Color{242, 244, 246, 255});
   const std::string owned(label);
   SDL_Surface* surface =
-      TTF_RenderUTF8_Blended(m_font_large, owned.c_str(), SDL_Color{246, 248, 252, 255});
+      TTF_RenderUTF8_Blended(m_font_large, owned.c_str(), SDL_Color{18, 20, 24, 255});
   if (surface)
   {
     SDL_Texture* text = SDL_CreateTextureFromSurface(m_renderer, surface);
@@ -2960,11 +2933,9 @@ void Launcher::InitializeUiTextures()
   m_glyphs[2] = MakeGlyph("X", false);
   m_glyphs[3] = MakeGlyph("Y", false);
   m_glyphs[4] = MakeGlyph("+", false);
-  m_glyphs[5] = MakeGlyph("L", true);
-  m_glyphs[6] = MakeGlyph("R", true);
-  m_glyphs[7] = MakeGlyph("-", false);
-  m_glyphs[8] = MakeGlyph("<", false);
-  m_glyphs[9] = MakeGlyph(">", false);
+  m_glyphs[5] = MakeGlyph("< >", true);
+  m_glyphs[6] = MakeGlyph("^ v", true);
+  m_settings_icon = IMG_LoadTexture(m_renderer, "romfs:/icons/settings.svg");
   m_flags[1] = MakeFlagTexture(DiscIO::Region::NTSC_U, 36, 24);
   m_flags[2] = MakeFlagTexture(DiscIO::Region::PAL, 36, 24);
   m_flags[3] = MakeFlagTexture(DiscIO::Region::NTSC_J, 36, 24);
@@ -2972,6 +2943,9 @@ void Launcher::InitializeUiTextures()
 
 void Launcher::DestroyUiTextures()
 {
+  if (m_settings_icon)
+    SDL_DestroyTexture(m_settings_icon);
+  m_settings_icon = nullptr;
   for (SDL_Texture*& texture : m_glyphs)
   {
     if (texture)
@@ -3018,7 +2992,7 @@ void Launcher::EnsureGlowTexture()
   SDL_FreeSurface(surface);
 }
 
-void Launcher::DrawBubbles(float time)
+void Launcher::DrawWiiBackground(float time)
 {
   const SDL_Color top{70, 198, 229, 255};
   const SDL_Color middle{15, 147, 193, 255};
@@ -3140,207 +3114,16 @@ void Launcher::DrawBubbles(float time)
   }
 }
 
-void Launcher::DrawXmbRibbon(float time, float center, float amplitude, float frequency,
-                             float slope, float phase, int half_width, SDL_Color color)
-{
-  constexpr int point_count = 121;
-  std::array<SDL_Point, point_count> base{};
-  std::array<SDL_Point, point_count> points{};
-  const auto wave_y = [&](float x) {
-    const float primary = std::sin(x * 6.2831853f * frequency + phase + time * 0.115f);
-    const float detail =
-        std::sin(x * 6.2831853f * (frequency * 2.07f) + phase * 0.61f - time * 0.072f);
-    return center + slope * (x - 0.5f) + amplitude * (primary + detail * 0.24f);
-  };
-  for (int point = 0; point < point_count; ++point)
-  {
-    const float x = static_cast<float>(point) / (point_count - 1);
-    base[point] = {static_cast<int>(x * m_width), static_cast<int>(wave_y(x) * m_height)};
-  }
-  for (int offset = -half_width; offset <= half_width; ++offset)
-  {
-    const float distance = half_width ? std::abs(static_cast<float>(offset) / half_width) : 0.0f;
-    const Uint8 alpha =
-        static_cast<Uint8>(color.a * std::pow(std::max(0.0f, 1.0f - distance), 1.45f));
-    if (alpha < 2)
-      continue;
-    for (int point = 0; point < point_count; ++point)
-      points[point] = {base[point].x, base[point].y + offset};
-    SDL_SetRenderDrawColor(m_renderer, color.r, color.g, color.b, alpha);
-    SDL_RenderDrawLines(m_renderer, points.data(), points.size());
-  }
-}
-
-void Launcher::DrawXmbFilament(float time, float center, float amplitude, float frequency,
-                               float slope, float phase, SDL_Color color)
-{
-  constexpr int point_count = 161;
-  std::array<SDL_Point, point_count> points{};
-  for (int point = 0; point < point_count; ++point)
-  {
-    const float x = static_cast<float>(point) / (point_count - 1);
-    const float primary = std::sin(x * 6.2831853f * frequency + phase + time * 0.115f);
-    const float detail =
-        std::sin(x * 6.2831853f * (frequency * 2.07f) + phase * 0.61f - time * 0.072f);
-    const float y = center + slope * (x - 0.5f) + amplitude * (primary + detail * 0.24f);
-    points[point] = {static_cast<int>(x * m_width), static_cast<int>(y * m_height)};
-  }
-  SDL_SetRenderDrawColor(m_renderer, color.r, color.g, color.b, color.a);
-  SDL_RenderDrawLines(m_renderer, points.data(), points.size());
-}
-
-void Launcher::DrawXmbSparkles(float time)
-{
-  for (int index = 0; index < 42; ++index)
-  {
-    const float x =
-        std::fmod(index * 0.618034f + time * (0.0022f + (index % 5) * 0.00045f), 1.08f) - 0.04f;
-    const float primary = std::sin(x * 6.2831853f * 0.91f + 0.4f + time * 0.115f);
-    const float detail = std::sin(x * 6.2831853f * (0.91f * 2.07f) + 0.4f * 0.61f - time * 0.072f);
-    const float y = 0.585f + 0.075f * (x - 0.5f) + 0.095f * (primary + detail * 0.24f) +
-                    (std::fmod(index * 0.413f, 1.0f) - 0.5f) * 0.31f;
-    const float pulse =
-        0.5f + 0.5f * std::sin(time * (0.55f + (index % 7) * 0.08f) + index * 1.731f);
-    const Uint8 alpha = static_cast<Uint8>(28.0f + pulse * (index % 9 == 0 ? 142.0f : 82.0f));
-    const int px = static_cast<int>(x * m_width);
-    const int py = static_cast<int>(y * m_height);
-    const int size = index % 9 == 0 ? 3 : 2;
-    FillRect(px, py, size, size, SDL_Color{220, 246, 255, alpha});
-    if (index % 9 == 0 && pulse > 0.55f)
-    {
-      SDL_SetRenderDrawColor(m_renderer, 235, 251, 255, static_cast<Uint8>(alpha * 0.62f));
-      SDL_RenderDrawLine(m_renderer, px - 5, py + 1, px + 7, py + 1);
-      SDL_RenderDrawLine(m_renderer, px + 1, py - 5, px + 1, py + 7);
-    }
-  }
-}
-
-void Launcher::DrawXmb(float time)
-{
-  const SDL_Color top{8, 51, 104, 255};
-  const SDL_Color middle{12, 82, 139, 255};
-  const SDL_Color bottom{6, 39, 82, 255};
-  const auto blend = [](Uint8 first, Uint8 second, float amount) {
-    return static_cast<Uint8>(first + (second - first) * std::clamp(amount, 0.0f, 1.0f));
-  };
-  constexpr int bands = 72;
-  for (int band = 0; band < bands; ++band)
-  {
-    const float y = (band + 0.5f) / bands;
-    SDL_Color color{};
-    if (y < 0.52f)
-    {
-      const float amount = y / 0.52f;
-      color = {blend(top.r, middle.r, amount), blend(top.g, middle.g, amount),
-               blend(top.b, middle.b, amount), 255};
-    }
-    else
-    {
-      const float amount = (y - 0.52f) / 0.48f;
-      color = {blend(middle.r, bottom.r, amount), blend(middle.g, bottom.g, amount),
-               blend(middle.b, bottom.b, amount), 255};
-    }
-    const int y0 = band * m_height / bands;
-    const int y1 = (band + 1) * m_height / bands;
-    FillRect(0, y0, m_width, y1 - y0, color);
-  }
-
-  EnsureGlowTexture();
-  if (m_glow)
-  {
-    const auto glow = [&](float x, float y, float radius, Uint8 red, Uint8 green, Uint8 blue,
-                          Uint8 alpha) {
-      const int diameter = static_cast<int>(m_height * radius);
-      SDL_Rect destination{static_cast<int>(m_width * x) - diameter / 2,
-                           static_cast<int>(m_height * y) - diameter / 2, diameter, diameter};
-      SDL_SetTextureColorMod(m_glow, red, green, blue);
-      SDL_SetTextureAlphaMod(m_glow, alpha);
-      SDL_RenderCopy(m_renderer, m_glow, nullptr, &destination);
-    };
-    glow(0.10f, 0.43f, 1.18f, 55, 157, 255, 32);
-    glow(0.84f, 0.38f, 0.92f, 41, 112, 228, 24);
-  }
-  DrawXmbRibbon(time, 0.655f, 0.082f, 0.78f, -0.105f, 2.15f, std::max(12, m_height / 18),
-                SDL_Color{63, 166, 255, 31});
-  DrawXmbRibbon(time, 0.575f, 0.074f, 0.96f, 0.080f, 0.35f, std::max(10, m_height / 25),
-                SDL_Color{189, 235, 255, 26});
-  DrawXmbRibbon(time, 0.605f, 0.049f, 1.28f, -0.025f, 3.82f, std::max(5, m_height / 54),
-                SDL_Color{230, 250, 255, 36});
-  for (int trace = 0; trace < 9; ++trace)
-  {
-    const float offset = (trace - 4) * 0.009f;
-    DrawXmbFilament(time, 0.588f + offset, 0.083f + trace * 0.0017f, 0.91f, 0.052f,
-                    0.62f + trace * 0.19f,
-                    SDL_Color{202, 241, 255, static_cast<Uint8>(18 + trace % 3 * 8)});
-  }
-  DrawXmbFilament(time, 0.578f, 0.073f, 0.96f, 0.080f, 0.35f, SDL_Color{243, 253, 255, 136});
-  DrawXmbSparkles(time);
-  if (m_glow)
-  {
-    SDL_SetTextureColorMod(m_glow, 255, 255, 255);
-    SDL_SetTextureAlphaMod(m_glow, 255);
-  }
-}
-
 void Launcher::ClearBackground()
 {
-  // Footer hit rects only describe the frame that drew them.
   m_footer_hit_count = 0;
   SDL_RenderSetClipRect(m_renderer, nullptr);
   SDL_SetRenderDrawColor(m_renderer, m_background.r, m_background.g, m_background.b, 255);
   SDL_RenderClear(m_renderer);
-  const float time = m_animations ? SDL_GetTicks() / 1000.0f : 0.0f;
-  if (m_theme == Theme::Xmb)
-  {
-    DrawXmb(time);
-    return;
-  }
-  if (m_theme == Theme::Bubbles)
-  {
-    DrawBubbles(time);
-    return;
-  }
-  if (m_theme != Theme::Glow)
-    return;
-  EnsureGlowTexture();
-  if (!m_glow)
-    return;
-  struct Glow
-  {
-    float x, y, radius;
-    Uint8 r, g, b, a;
-  };
-  const std::array<Glow, 4> glows = {
-      {{0.10f + 0.13f * std::sin(time * 0.43f), 0.20f + 0.11f * std::cos(time * 0.37f), 0.90f, 45,
-        140, 255, 128},
-       {0.84f + 0.12f * std::cos(time * 0.34f), 0.34f + 0.10f * std::sin(time * 0.41f), 0.78f, 154,
-        75, 255, 112},
-       {0.54f + 0.10f * std::sin(time * 0.29f), 0.91f + 0.06f * std::cos(time * 0.33f), 0.94f, 0,
-        210, 190, 94},
-       {0.42f + 0.08f * std::cos(time * 0.25f), 0.48f + 0.09f * std::sin(time * 0.31f), 0.58f, 64,
-        125, 255, 67}}};
-  for (const Glow& glow : glows)
-  {
-    const int diameter = static_cast<int>(m_height * glow.radius);
-    SDL_Rect destination{static_cast<int>(m_width * glow.x) - diameter / 2,
-                         static_cast<int>(m_height * glow.y) - diameter / 2, diameter, diameter};
-    SDL_SetTextureColorMod(m_glow, glow.r, glow.g, glow.b);
-    SDL_SetTextureAlphaMod(m_glow, glow.a);
-    SDL_RenderCopy(m_renderer, m_glow, nullptr, &destination);
-  }
-  for (int index = 0; index < 28; ++index)
-  {
-    const float travel =
-        std::fmod(index * 0.371f + time * 0.011f * (0.65f + (index % 5) * 0.11f), 1.12f) - 0.06f;
-    const float y =
-        std::fmod(index * 0.217f + 0.11f * std::sin(time * 0.29f + index * 1.73f), 1.0f);
-    const float pulse = 0.45f + 0.55f * std::sin(time * (0.9f + (index % 4) * 0.17f) + index);
-    FillRect(static_cast<int>(travel * m_width), static_cast<int>(y * m_height),
-             index % 9 == 0 ? 3 : 2, index % 9 == 0 ? 3 : 2,
-             SDL_Color{182, 224, 255, static_cast<Uint8>(88 * (0.55f + 0.45f * pulse))});
-  }
-  SDL_SetTextureColorMod(m_glow, 255, 255, 255);
-  SDL_SetTextureAlphaMod(m_glow, 255);
+  if (m_theme == Theme::Classic)
+    DrawClassicBackground();
+  else
+    DrawWiiBackground(m_animations ? SDL_GetTicks() / 1000.0f : 0.0f);
 }
 
 int Launcher::TextWidth(TTF_Font* font, std::string_view text)
@@ -3742,16 +3525,9 @@ void Launcher::DrawPageHeader(std::string_view title, std::string_view eyebrow,
                               std::string_view summary, std::string_view detail)
 {
   const int height = TopBarHeight();
-  constexpr int margin = 32;
-  constexpr int logo_size = 48;
-  constexpr int left = margin + logo_size + 20;
-  FillRect(0, 0, m_width, height, m_panel);
-  FillRect(0, height - 1, m_width, 1, SDL_Color{255, 255, 255, 18});
-  if (m_logo)
-  {
-    SDL_Rect destination{margin, 16, logo_size, logo_size};
-    SDL_RenderCopy(m_renderer, m_logo, nullptr, &destination);
-  }
+  constexpr int margin = 40;
+  constexpr int left = margin;
+  DrawGradient({0, 0, m_width, height + 48}, {0, 0, 0, 125}, {0, 0, 0, 0});
   const int metadata_width = std::min(
       m_width / 3, std::max(TextWidth(m_font_small, summary), TextWidth(m_font_small, detail)));
   const int title_width = m_width - left - margin - (metadata_width ? metadata_width + 32 : 0);
@@ -3863,7 +3639,19 @@ void Launcher::DrawArtworkPreview(SDL_Texture* texture, const SDL_Rect& rect, bo
   {
     SDL_SetTextureAlphaMod(texture, 255);
     SDL_SetTextureColorMod(texture, 255, 255, 255);
-    SDL_RenderCopy(m_renderer, texture, nullptr, &rect);
+    int width = 0, height = 0;
+    SDL_QueryTexture(texture, nullptr, nullptr, &width, &height);
+    if (width > 0 && height > 0)
+    {
+      const double scale =
+          std::min(static_cast<double>(rect.w) / width, static_cast<double>(rect.h) / height);
+      const int fitted_width = std::max(1, static_cast<int>(std::lround(width * scale)));
+      const int fitted_height = std::max(1, static_cast<int>(std::lround(height * scale)));
+      const SDL_Rect destination{rect.x + (rect.w - fitted_width) / 2,
+                                 rect.y + (rect.h - fitted_height) / 2, fitted_width,
+                                 fitted_height};
+      SDL_RenderCopy(m_renderer, texture, nullptr, &destination);
+    }
   }
   else if (!placeholder.empty())
   {
@@ -3899,39 +3687,21 @@ void Launcher::DrawButtonHint(int x, int y, std::string_view button, std::string
   }
   else
   {
-    width = TextWidth(m_font_small, button) + 14;
-    height = FontHeight(m_font_small) + 6;
-    Border(x, y - height / 2, width, height, 1, m_dim);
-    DrawTextCentered(m_font_small, x + width / 2, y - FontHeight(m_font_small) / 2, button,
-                     m_text);
+    width = TextWidth(m_font_hint, button) + 14;
+    height = FontHeight(m_font_hint) + 6;
+    RoundedPanel(x, y - height / 2, width, height, m_card, m_dim, height / 2);
+    DrawTextCentered(m_font_hint, x + width / 2, y - FontHeight(m_font_hint) / 2, button, m_text);
   }
   if (!label.empty())
-    DrawText(m_font_small, x + width + 8, y - FontHeight(m_font_small) / 2, label, label_color);
+    DrawText(m_font_hint, x + width + 8, y - FontHeight(m_font_hint) / 2, label, label_color);
 }
 
 SDL_Texture* Launcher::ButtonGlyph(std::string_view button) const
 {
-  if (button == "A")
-    return m_glyphs[0];
-  if (button == "B")
-    return m_glyphs[1];
-  if (button == "X")
-    return m_glyphs[2];
-  if (button == "Y")
-    return m_glyphs[3];
-  if (button == "+")
-    return m_glyphs[4];
-  if (button == "L")
-    return m_glyphs[5];
-  if (button == "R")
-    return m_glyphs[6];
-  if (button == "-")
-    return m_glyphs[7];
-  if (button == "Left")
-    return m_glyphs[8];
-  if (button == "Right")
-    return m_glyphs[9];
-  return nullptr;
+  static constexpr std::array<std::string_view, 7> buttons = {
+      "A", "B", "X", "Y", "+", "Left / Right", "Up / Down"};
+  const auto found = std::ranges::find(buttons, button);
+  return found == buttons.end() ? nullptr : m_glyphs[found - buttons.begin()];
 }
 
 FooterLayout
@@ -3940,9 +3710,9 @@ Launcher::MeasureFooter(std::span<const std::pair<std::string_view, std::string_
   constexpr int glyph_gap = 16;
   constexpr int label_gap = 8;
   constexpr int pair_gap = 26;
-  constexpr int margin = 40;
+  constexpr int margin = 80;
   FooterLayout layout;
-  const int font_height = FontHeight(m_font_small);
+  const int font_height = FontHeight(m_font_hint);
   const int count = std::min(static_cast<int>(hints.size()),
                              static_cast<int>(layout.item_width.size()));
   for (int index = 0; index < count; ++index)
@@ -3952,15 +3722,13 @@ Launcher::MeasureFooter(std::span<const std::pair<std::string_view, std::string_
     int width = 0;
     if (glyph)
       SDL_QueryTexture(glyph, nullptr, nullptr, &width, nullptr);
-    width = glyph ? width / GLYPH_SUPERSAMPLE :
-                    TextWidth(m_font_small, hints[index].first) + 14;
+    width = glyph ? width / GLYPH_SUPERSAMPLE : TextWidth(m_font_hint, hints[index].first) + 14;
     if (!localized_label.empty())
-      width += label_gap + TextWidth(m_font_small, localized_label);
+      width += label_gap + TextWidth(m_font_hint, localized_label);
     layout.item_width[index] = width;
     layout.gap_after[index] = localized_label.empty() ? glyph_gap : pair_gap;
   }
 
-  // Wrap greedily so a long hint set (the library grid has eight) stays on screen.
   const int available = std::max(120, m_width - margin * 2);
   int index = 0;
   while (index < count && layout.row_count < static_cast<int>(layout.row_start.size()))
@@ -3986,12 +3754,16 @@ Launcher::MeasureFooter(std::span<const std::pair<std::string_view, std::string_
   return layout;
 }
 
-void Launcher::DrawFooterBand(int height)
+void Launcher::DrawLauncherMark(int center_y)
 {
-  if (height <= 0)
+  if (!m_logo)
     return;
-  FillRect(0, m_height - height, m_width, height, m_panel);
-  FillRect(0, m_height - height, m_width, 1, SDL_Color{255, 255, 255, 18});
+  int width = 0, height = 0;
+  SDL_QueryTexture(m_logo, nullptr, nullptr, &width, &height);
+  if (height < 1)
+    return;
+  const SDL_Rect rect{40, center_y - 48, width * 64 / height, 64};
+  SDL_RenderCopy(m_renderer, m_logo, nullptr, &rect);
 }
 
 void Launcher::DrawFooter(std::span<const std::pair<std::string_view, std::string_view>> hints,
@@ -4003,18 +3775,17 @@ void Launcher::DrawFooter(std::span<const std::pair<std::string_view, std::strin
     m_footer_hit_count = 0;
     return;
   }
-  const int font_height = FontHeight(m_font_small);
+  const int font_height = FontHeight(m_font_hint);
   const int y = center_y >= 0 ? center_y : m_height - 26;
-  if (y >= m_height - 40)
-  {
-    // Screen-bottom footers get their own band; footers drawn inside a modal panel do not.
-    DrawFooterBand(layout.height);
-  }
+  const bool screen_bottom = y >= m_height - 64;
+  if (screen_bottom)
+    DrawLauncherMark(y);
   const int first_row_y = y - (layout.row_count - 1) * layout.row_spacing;
   m_footer_hit_count = 0;
   for (int row = 0; row < layout.row_count; ++row)
   {
-    int x = (m_width - layout.row_width[row]) / 2;
+    int x = screen_bottom ? m_width - 40 - layout.row_width[row] :
+                            (m_width - layout.row_width[row]) / 2;
     const int row_y = first_row_y + row * layout.row_spacing;
     for (int index = layout.row_start[row]; index < layout.row_end[row]; ++index)
     {
@@ -4026,8 +3797,7 @@ void Launcher::DrawFooter(std::span<const std::pair<std::string_view, std::strin
         SDL_QueryTexture(glyph, nullptr, nullptr, nullptr, &glyph_height);
         glyph_height /= GLYPH_SUPERSAMPLE;
       }
-      // The first hint of a footer is the primary action, so it is not dimmed.
-      DrawButtonHint(x, row_y, button, hints[index].second, index == 0 ? m_text : m_dim);
+      DrawButtonHint(x, row_y, button, hints[index].second, m_text);
       if (m_footer_hit_count < static_cast<int>(m_footer_hits.size()))
       {
         const int hit_height = std::max(glyph_height, font_height);
@@ -4036,7 +3806,7 @@ void Launcher::DrawFooter(std::span<const std::pair<std::string_view, std::strin
         m_footer_buttons[m_footer_hit_count] =
             button == "A"     ? static_cast<int>(BUTTON_CONFIRM) :
             button == "B"     ? static_cast<int>(BUTTON_CANCEL) :
-            button == "X"     ? static_cast<int>(BUTTON_SETTINGS) :
+            button == "X"     ? static_cast<int>(BUTTON_X) :
             button == "Y"     ? static_cast<int>(SDL_CONTROLLER_BUTTON_X) :
             button == "+"     ? static_cast<int>(SDL_CONTROLLER_BUTTON_START) :
             button == "-"     ? static_cast<int>(SDL_CONTROLLER_BUTTON_BACK) :
@@ -4114,22 +3884,13 @@ void Launcher::DrawSettingsFooter(std::string_view text)
   }
   for (std::size_t index = 0; index + 1 < tokens.size(); index += 2)
   {
-    if (tokens[index] == "Left / Right")
-    {
-      hints.emplace_back("Left", std::string_view{});
-      hints.emplace_back("Right", tokens[index + 1]);
-    }
-    else
-    {
-      hints.emplace_back(tokens[index], tokens[index + 1]);
-    }
+    hints.emplace_back(tokens[index], tokens[index + 1]);
   }
   if (hints.empty())
   {
     m_footer_hit_count = 0;
     if (!text.empty())
     {
-      DrawFooterBand(FontHeight(m_font_small) + 32);
       DrawTextCentered(m_font_small, m_width / 2, m_height - 38, text, m_dim);
     }
   }
@@ -4141,6 +3902,7 @@ void Launcher::DrawSettingsFooter(std::string_view text)
 
 void Launcher::BeginScreenFx()
 {
+  m_library_triggers = {};
   m_screen_fx_start = SDL_GetTicks();
   m_highlight_y = -1.0f;
   m_text_scroll.clear();
@@ -4187,7 +3949,7 @@ void Launcher::ShowInfoCard(std::string_view section, std::string_view title, st
         close = true;
       if (event.type == SDL_CONTROLLERBUTTONDOWN &&
           (event.cbutton.button == BUTTON_CONFIRM || event.cbutton.button == BUTTON_CANCEL ||
-           event.cbutton.button == BUTTON_SETTINGS))
+           event.cbutton.button == BUTTON_X))
         close = true;
       if (event.type == SDL_KEYDOWN &&
           (event.key.keysym.sym == SDLK_RETURN || event.key.keysym.sym == SDLK_ESCAPE ||
@@ -4312,6 +4074,7 @@ bool Launcher::PollEvent(SDL_Event* event)
         {
           SDL_GameControllerClose(m_controller);
           m_controller = nullptr;
+          m_library_triggers = {};
           m_stick_x_latched = m_stick_y_latched = false;
           m_navigation_held = 0;
           m_navigation_since = m_navigation_last = 0;
@@ -4762,7 +4525,7 @@ void Launcher::LoadSourcesAndShares()
   m_usb_generation = Storage::UsbStatusGeneration();
   m_usb_locations = Storage::ListUsbLocations();
   LoadLibraryIdentities();
-  LoadLibraryOrganization();
+  LoadFavorites();
   StartAutoMountShares();
 }
 
@@ -5500,102 +5263,46 @@ void Launcher::MigrateLegacyGameState(Game* game)
   MarkStoreDirty();
 }
 
-void Launcher::LoadLibraryOrganization()
+void Launcher::LoadFavorites()
 {
-  // Collection and search are transient views. Always open a fresh launcher on the complete
-  // library, while favorites and collection membership themselves remain persistent.
-  const bool had_saved_view =
-      !m_store.Get("Library/ActiveCollection").empty() || !m_store.Get("Library/Search").empty();
-  m_active_collection.clear();
-  m_search_query.clear();
-  m_store.Remove("Library/ActiveCollection");
-  m_store.Remove("Library/Search");
-  if (had_saved_view)
-    MarkStoreDirty();
   m_favorites.clear();
-  const int favorite_count = std::clamp(m_store.GetInt("Library/FavoriteCount", 0), 0, 16384);
-  for (int index = 0; index < favorite_count; ++index)
+  const int count = std::clamp(m_store.GetInt("Library/FavoriteCount", 0), 0, 65536);
+  for (int index = 0; index < count; ++index)
   {
     const std::string id = m_store.Get("Library/Favorite" + std::to_string(index));
     if (!id.empty())
       m_favorites.insert(id);
   }
-  m_collections.clear();
-  const int collection_count = std::clamp(m_store.GetInt("Library/CollectionCount", 0), 0, 128);
-  for (int index = 0; index < collection_count; ++index)
-  {
-    const std::string prefix = "Library/Collection" + std::to_string(index);
-    Collection collection;
-    collection.name = m_store.Get(prefix + "Name");
-    std::string members = m_store.Get(prefix + "Members");
-    for (std::size_t start = 0; start <= members.size();)
-    {
-      const std::size_t separator = members.find(',', start);
-      const std::string member = members.substr(
-          start, separator == std::string::npos ? std::string::npos : separator - start);
-      if (!member.empty())
-        collection.members.insert(member);
-      if (separator == std::string::npos)
-        break;
-      start = separator + 1;
-    }
-    if (!collection.name.empty())
-      m_collections.emplace_back(std::move(collection));
-  }
+  m_library_view = LibraryView::Recent;
 }
 
-void Launcher::SaveCollections()
+void Launcher::SaveFavorites()
 {
   m_store.RemovePrefix("Library/Favorite");
   m_store.SetInt("Library/FavoriteCount", static_cast<int>(m_favorites.size()));
-  std::size_t favorite_index = 0;
+  std::size_t index = 0;
   for (const std::string& id : m_favorites)
-    m_store.Set("Library/Favorite" + std::to_string(favorite_index++), id);
-  m_store.RemovePrefix("Library/Collection");
-  m_store.SetInt("Library/CollectionCount", static_cast<int>(m_collections.size()));
-  for (std::size_t index = 0; index < m_collections.size(); ++index)
-  {
-    const std::string prefix = "Library/Collection" + std::to_string(index);
-    m_store.Set(prefix + "Name", m_collections[index].name);
-    std::string members;
-    for (const std::string& id : m_collections[index].members)
-    {
-      if (!members.empty())
-        members += ',';
-      members += id;
-    }
-    m_store.Set(prefix + "Members", std::move(members));
-  }
+    m_store.Set("Library/Favorite" + std::to_string(index++), id);
   MarkStoreDirty();
 }
 
 void Launcher::RebuildVisibleGames()
 {
   m_visible_games.clear();
-  const std::string query = Lower(Trim(m_search_query));
-  const Collection* active = nullptr;
-  if (!m_active_collection.empty() && m_active_collection != "favorites")
-  {
-    const auto found = std::ranges::find(m_collections, m_active_collection, &Collection::name);
-    if (found != m_collections.end())
-      active = &*found;
-  }
   for (std::size_t index = 0; index < m_games.size(); ++index)
   {
     const Game& game = m_games[index];
-    if (m_active_collection == "favorites" && !m_favorites.contains(game.key))
+    if (m_library_view == LibraryView::Recent && game.played <= 0)
       continue;
-    if (active && !active->members.contains(game.key))
+    if (m_library_view == LibraryView::Favorites && !m_favorites.contains(game.key))
       continue;
-    if (!query.empty())
-    {
-      const std::string searchable =
-          Lower(game.title + " " + game.game_id + " " + game.platform + " " + game.path);
-      if (searchable.find(query) == std::string::npos)
-        continue;
-    }
     m_visible_games.push_back(index);
   }
+  if (m_library_view == LibraryView::Recent)
+    std::stable_sort(m_visible_games.begin(), m_visible_games.end(),
+                     [&](std::size_t left, std::size_t right) {
+                       return m_games[left].played > m_games[right].played;
+                     });
 }
 
 Game* Launcher::VisibleGame(int index)
@@ -5625,8 +5332,7 @@ void Launcher::StartGameScan(std::vector<std::string> sources, bool replace)
   {
     for (Game& game : m_games)
     {
-      if (game.cover)
-        SDL_DestroyTexture(game.cover);
+      ReleaseGameArtwork(game);
     }
     m_games.clear();
     m_visible_games.clear();
@@ -5644,8 +5350,8 @@ void Launcher::StartGameScan(std::vector<std::string> sources, bool replace)
         return false;
       const bool in_target = std::ranges::any_of(
           sources, [&](const std::string& source) { return PathAtOrBelow(game.path, source); });
-      if (in_target && game.cover)
-        SDL_DestroyTexture(game.cover);
+      if (in_target)
+        ReleaseGameArtwork(game);
       return in_target;
     });
     for (const Game& game : m_games)
@@ -5691,21 +5397,13 @@ void Launcher::StartGameScan(std::vector<std::string> sources, bool replace)
       known_fingerprints.emplace(record.canonical_path,
                                  std::pair{record.base_identity, record.fingerprint});
   }
-  // Load entries from the saved collection first. This is especially important when Dolphin was
-  // closed while a collection was active: its first page should appear immediately instead of
-  // waiting for unrelated games earlier in a large source tree.
   std::unordered_set<std::string> priority_ids;
-  if (m_active_collection == "favorites")
-  {
+  if (m_library_view == LibraryView::Favorites)
     priority_ids = m_favorites;
-  }
-  else if (!m_active_collection.empty())
-  {
-    const auto collection =
-        std::ranges::find(m_collections, m_active_collection, &Collection::name);
-    if (collection != m_collections.end())
-      priority_ids = collection->members;
-  }
+  else if (m_library_view == LibraryView::Recent)
+    for (const LibraryIdentityRecord& record : m_library_identities)
+      if (m_store.GetInt("Recent/" + record.id, 0) > 0)
+        priority_ids.insert(record.id);
   std::vector<std::string> priority_paths;
   priority_paths.reserve(priority_ids.size());
   for (const LibraryIdentityRecord& record : m_library_identities)
@@ -5825,9 +5523,6 @@ void Launcher::StartGameScan(std::vector<std::string> sources, bool replace)
           }
           if (game.fingerprint.empty())
             game.fingerprint = GameFingerprint(*metadata);
-          struct stat info{};
-          if (::stat(game.path.c_str(), &info) == 0)
-            game.modified = info.st_mtime;
           {
             std::lock_guard lock(state->mutex);
             state->ready.emplace_back(std::move(game));
@@ -5901,7 +5596,6 @@ void Launcher::StartGameScan(std::vector<std::string> sources, bool replace)
             game.game_id = title.game_id;
             game.game_tdb_id = title.game_tdb_id;
             game.revision = title.revision;
-            game.modified = title.modified;
             game.region = title.region;
             game.platform = "WiiWare / VC";
             game.installed_nand = true;
@@ -5979,8 +5673,7 @@ void Launcher::PumpGameScan()
         std::erase_if(m_games, [&](Game& existing) {
           if (!existing.installed_nand || existing.title_id != game.title_id)
             return false;
-          if (existing.cover)
-            SDL_DestroyTexture(existing.cover);
+          ReleaseGameArtwork(existing);
           return true;
         });
       }
@@ -5992,7 +5685,6 @@ void Launcher::PumpGameScan()
     if (!alias.empty())
     {
       game.title = alias;
-      game.has_custom_title = true;
     }
     game.played = m_store.GetInt("Recent/" + game.key, 0);
     game.has_game_config = RegularFileExists(GameIniPath(game));
@@ -6010,8 +5702,7 @@ void Launcher::PumpGameScan()
                                       game.fingerprint != existing->fingerprint);
       if (metadata_changed)
       {
-        if (existing->cover)
-          SDL_DestroyTexture(existing->cover);
+        ReleaseGameArtwork(*existing);
       }
       else
       {
@@ -6021,6 +5712,11 @@ void Launcher::PumpGameScan()
         game.cover_loaded_at = existing->cover_loaded_at;
         game.cover_attempted = existing->cover_attempted;
         game.cover_queued = existing->cover_queued;
+        game.background = existing->background;
+        game.background_use = existing->background_use;
+        game.background_request = existing->background_request;
+        game.background_attempted = existing->background_attempted;
+        game.background_queued = existing->background_queued;
       }
       *existing = std::move(game);
       ++published;
@@ -6071,158 +5767,11 @@ void Launcher::ScanGames()
   StartGameScan(m_sources, true);
 }
 
-[[maybe_unused]] void Launcher::ScanGamesLegacy()
-{
-  RefreshConfiguredUsbSources();
-  m_usb_locations = Storage::ListUsbLocations();
-  m_claimed_library_ids.clear();
-  for (Game& game : m_games)
-  {
-    if (game.cover)
-      SDL_DestroyTexture(game.cover);
-  }
-  m_games.clear();
-  m_cover_use = 0;
-
-  ClearBackground();
-  DrawHeader("Dolphin");
-  const int scan_panel_width = std::min(940, m_width - 64);
-  GlassPanel((m_width - scan_panel_width) / 2, m_height / 2 - 100, scan_panel_width, 176);
-  DrawTextCentered(m_font_large, m_width / 2, m_height / 2 - 60,
-                   Ellipsize(m_font_large, "Scanning game library...", scan_panel_width - 64),
-                   m_text);
-  DrawTextCentered(
-      m_font_small, m_width / 2, m_height / 2 + 8,
-      Ellipsize(m_font_small, "SD, USB and connected SMB sources are indexed with Dolphin metadata.",
-                scan_panel_width - 64),
-      m_dim);
-  SDL_RenderPresent(m_renderer);
-
-  std::vector<std::string_view> source_views;
-  source_views.reserve(m_sources.size());
-  for (const std::string& source : m_sources)
-    source_views.emplace_back(source);
-  const std::vector<std::string> paths = UICommon::FindAllGamePaths(source_views, true);
-  m_game_cache.Load();
-  if (m_game_cache.Update(paths))
-    m_game_cache.Save();
-  std::unordered_set<std::string> path_set(paths.begin(), paths.end());
-  std::unordered_set<std::uint64_t> source_wad_titles;
-  m_game_cache.ForEach([&](const std::shared_ptr<const UICommon::GameFile>& metadata) {
-    if (!metadata || !metadata->IsValid() || !path_set.contains(metadata->GetFilePath()))
-      return;
-    Game game;
-    game.metadata = metadata;
-    game.path = metadata->GetFilePath();
-    game.game_id = metadata->GetGameID();
-    game.game_tdb_id = metadata->GetGameTDBID();
-    game.title_id = metadata->GetTitleID();
-    game.revision = metadata->GetRevision();
-    game.title = metadata->GetName(UICommon::GameFile::Variant::LongAndPossiblyCustom);
-    if (game.title.empty())
-      game.title = metadata->GetFileName();
-    game.region = metadata->GetRegion();
-    switch (metadata->GetPlatform())
-    {
-    case DiscIO::Platform::GameCubeDisc:
-      game.platform = "GameCube";
-      break;
-    case DiscIO::Platform::WiiDisc:
-      game.platform = "Wii";
-      break;
-    case DiscIO::Platform::WiiWAD:
-      game.platform = "WiiWare / VC";
-      if (game.title_id != 0)
-        source_wad_titles.insert(game.title_id);
-      break;
-    case DiscIO::Platform::Triforce:
-      game.platform = "Triforce";
-      break;
-    case DiscIO::Platform::ELFOrDOL:
-      game.platform = "Executable";
-      break;
-    default:
-      game.platform = "Unknown";
-      break;
-    }
-    char suffix[32];
-    std::snprintf(suffix, sizeof(suffix), "-%04x-%016llx", game.revision,
-                  static_cast<unsigned long long>(HashPath(Lower(game.path))));
-    game.legacy_key = (game.game_id.empty() ? "game" : game.game_id) + suffix;
-    AssignStableIdentity(&game);
-    MigrateLegacyGameState(&game);
-    const std::string alias = m_store.Get("Alias/" + game.key);
-    if (!alias.empty())
-    {
-      game.title = alias;
-      game.has_custom_title = true;
-    }
-    game.played = m_store.GetInt("Recent/" + game.key, 0);
-    struct stat info{};
-    if (::stat(game.path.c_str(), &info) == 0)
-      game.modified = info.st_mtime;
-    m_games.emplace_back(std::move(game));
-  });
-
-  for (const Tools::InstalledTitle& title : Tools::ListInstalledWiiTitles())
-  {
-    if (!title.bootable || title.system_title || source_wad_titles.contains(title.title_id))
-      continue;
-
-    Game game;
-    game.title_id = title.title_id;
-    game.title = title.name;
-    game.game_id = title.game_id;
-    game.game_tdb_id = title.game_tdb_id;
-    game.revision = title.revision;
-    game.modified = title.modified;
-    game.region = title.region;
-    game.platform = "WiiWare / VC";
-    game.installed_nand = true;
-    char key[32];
-    std::snprintf(key, sizeof(key), "nand-%016llx",
-                  static_cast<unsigned long long>(title.title_id));
-    game.key = key;
-    const std::string alias = m_store.Get("Alias/" + game.key);
-    if (!alias.empty())
-    {
-      game.title = alias;
-      game.has_custom_title = true;
-    }
-    game.played = m_store.GetInt("Recent/" + game.key, 0);
-    m_games.emplace_back(std::move(game));
-  }
-
-  std::unordered_map<std::string, std::size_t> game_id_counts;
-  for (const Game& game : m_games)
-  {
-    if (!game.installed_nand && !game.game_id.empty())
-      ++game_id_counts[game.game_id];
-  }
-  for (Game& game : m_games)
-  {
-    // Renamed mods and multiple images with the same internal disc ID need a path-specific layer.
-    // Images without an ID also need this path because the regular Game ID INI has no filename.
-    if (!game.installed_nand &&
-        (game.has_custom_title || game.game_id.empty() || game_id_counts[game.game_id] > 1))
-    {
-      game.config_override_path = EntryGameIniPath(game);
-    }
-    game.has_game_config = RegularFileExists(GameIniPath(game));
-  }
-  SaveLibraryIdentities();
-  SortGames();
-  m_library_refresh_requested = false;
-}
-
 void Launcher::SortGames()
 {
-  std::ranges::sort(m_games, [&](const Game& left, const Game& right) {
-    if (m_sort_mode == SortMode::RecentlyPlayed && left.played != right.played)
-      return left.played > right.played;
-    if (m_sort_mode == SortMode::RecentlyAdded && left.modified != right.modified)
-      return left.modified > right.modified;
-    return Lower(left.title) < Lower(right.title);
+  std::ranges::sort(m_games, [](const Game& left, const Game& right) {
+    const std::string left_title = Lower(left.title), right_title = Lower(right.title);
+    return left_title != right_title ? left_title < right_title : left.key < right.key;
   });
   RebuildVisibleGames();
 }
@@ -6633,7 +6182,7 @@ int Launcher::RunRows(std::string_view title, std::string_view context,
         else if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT &&
                  rows[selection].enabled && rows[selection].adjustable)
           action(selection, 1);
-        else if (event.cbutton.button == BUTTON_SETTINGS)
+        else if (event.cbutton.button == BUTTON_X)
         {
           const SettingHelpInfo info = SettingHelpFor(title, rows[selection]);
           const std::string_view current = rows[selection].value == ">" ?
@@ -6759,9 +6308,7 @@ int Launcher::RunRows(std::string_view title, std::string_view context,
     int hint_count = 0;
     if (can_adjust)
     {
-      // The empty label is the deliberate glyph pair: Left and Right share one caption.
-      footer[hint_count++] = {"Left", ""};
-      footer[hint_count++] = {"Right", "Change"};
+      footer[hint_count++] = {"Left / Right", "Change"};
     }
     if (rows[selection].enabled)
       footer[hint_count++] = {"A", "Choose"};
@@ -6788,6 +6335,7 @@ CoverDecodeResult Launcher::DecodeCover(const CoverDecodeJob& job)
   result.key = job.key;
   result.request = job.request;
   result.epoch = job.epoch;
+  result.background = job.background;
   SDL_Surface* surface = nullptr;
   bool custom_exists = RegularFileExists(job.custom_path);
   // Finish an interrupted atomic import before loading the cover. The normal path performs only
@@ -6817,8 +6365,8 @@ CoverDecodeResult Launcher::DecodeCover(const CoverDecodeJob& job)
       SDL_FreeSurface(surface);
     return result;
   }
-  constexpr int maximum_width = 360;
-  constexpr int maximum_height = 540;
+  const int maximum_width = job.background ? 1280 : 360;
+  const int maximum_height = job.background ? 720 : 540;
   int width = surface->w;
   int height = surface->h;
   if (width > maximum_width)
@@ -6954,21 +6502,27 @@ void Launcher::CancelQueuedCoverDecodes()
   {
     game.cover_queued = false;
     game.cover_request = 0;
+    game.background_queued = false;
+    game.background_request = 0;
   }
   m_cover_decode_condition.notify_all();
 }
 
-void Launcher::QueueCoverDecode(Game* game, bool priority)
+void Launcher::QueueCoverDecode(Game* game, bool priority, bool background)
 {
-  if (!game || game->cover || game->cover_attempted)
+  if (!game)
     return;
-  if (game->cover_queued)
+  bool& queued = background ? game->background_queued : game->cover_queued;
+  bool& attempted = background ? game->background_attempted : game->cover_attempted;
+  std::uint64_t& request = background ? game->background_request : game->cover_request;
+  if ((background ? game->background : game->cover) || attempted)
+    return;
+  if (queued)
   {
     if (priority)
     {
       std::lock_guard lock(m_cover_decode_mutex);
-      const auto found = std::ranges::find(m_cover_decode_jobs, game->cover_request,
-                                           &CoverDecodeJob::request);
+      const auto found = std::ranges::find(m_cover_decode_jobs, request, &CoverDecodeJob::request);
       if (found != m_cover_decode_jobs.end() && found != m_cover_decode_jobs.begin())
       {
         CoverDecodeJob job = std::move(*found);
@@ -6982,15 +6536,14 @@ void Launcher::QueueCoverDecode(Game* game, bool priority)
   if (m_cover_decode_budget <= 0)
     return;
   --m_cover_decode_budget;
-
   CoverDecodeJob job;
   job.key = game->key;
-  job.custom_path = CoverPath(*game);
-  job.metadata = game->metadata;
+  job.background = background;
+  job.custom_path = background ? BackgroundPath(*game) : CoverPath(*game);
+  job.metadata = background ? nullptr : game->metadata;
   job.request = ++m_cover_request_serial;
-  game->cover_request = job.request;
-  game->cover_queued = true;
-
+  request = job.request;
+  queued = true;
   CoverDecodeJob dropped;
   bool did_drop = false;
   {
@@ -7008,14 +6561,15 @@ void Launcher::QueueCoverDecode(Game* game, bool priority)
       m_cover_decode_jobs.emplace_back(std::move(job));
   }
   if (did_drop)
-  {
-    const auto old = std::ranges::find(m_games, dropped.key, &Game::key);
-    if (old != m_games.end() && old->cover_request == dropped.request)
+    if (Game* old = FindGameByKey(dropped.key))
     {
-      old->cover_queued = false;
-      old->cover_request = 0;
+      auto& old_request = dropped.background ? old->background_request : old->cover_request;
+      if (old_request == dropped.request)
+      {
+        (dropped.background ? old->background_queued : old->cover_queued) = false;
+        old_request = 0;
+      }
     }
-  }
   m_cover_decode_condition.notify_one();
 }
 
@@ -7065,16 +6619,22 @@ void Launcher::PumpCoverDecodeResults()
     m_cover_decode_condition.notify_one();
     ++processed;
     const auto game = std::ranges::find(m_games, result.key, &Game::key);
-    if (game == m_games.end() || game->cover_request != result.request)
+    if (game == m_games.end() || result.epoch != m_cover_decode_epoch ||
+        (result.background ? game->background_request : game->cover_request) != result.request)
       continue;
-    game->cover_queued = false;
-    game->cover_attempted = true;
+    (result.background ? game->background_queued : game->cover_queued) = false;
+    (result.background ? game->background_attempted : game->cover_attempted) = true;
     if (result.pixels.empty())
       continue;
     SDL_Texture* texture = UploadCoverTexture(result);
     ++uploads;
     if (!texture)
       continue;
+    if (result.background)
+    {
+      InstallBackground(&*game, texture);
+      continue;
+    }
     if (std::ranges::count_if(m_games, [](const Game& item) { return item.cover != nullptr; }) >=
         COVER_CACHE_LIMIT)
     {
@@ -7086,14 +6646,22 @@ void Launcher::PumpCoverDecodeResults()
   }
 }
 
-SDL_Texture* Launcher::LoadScaledTexture(const std::string& path, int width, int height)
+SDL_Texture* Launcher::LoadScaledTexture(const std::string& path, int width, int height,
+                                         bool preserve_aspect)
 {
   SDL_Surface* source = IMG_Load(path.c_str());
   if (!source)
     return nullptr;
   // Decode at output resolution; callers pass logical sizes.
-  const int decode_width = std::max(1, static_cast<int>(std::lround(width * m_ui_scale)));
-  const int decode_height = std::max(1, static_cast<int>(std::lround(height * m_ui_scale)));
+  int decode_width = std::max(1, static_cast<int>(std::lround(width * m_ui_scale)));
+  int decode_height = std::max(1, static_cast<int>(std::lround(height * m_ui_scale)));
+  if (preserve_aspect && source->w > 0 && source->h > 0)
+  {
+    const double scale = std::min(static_cast<double>(decode_width) / source->w,
+                                  static_cast<double>(decode_height) / source->h);
+    decode_width = std::max(1, static_cast<int>(std::lround(source->w * scale)));
+    decode_height = std::max(1, static_cast<int>(std::lround(source->h * scale)));
+  }
   SDL_Surface* scaled = SDL_CreateRGBSurfaceWithFormat(0, decode_width, decode_height, 32,
                                                        SDL_PIXELFORMAT_RGBA32);
   if (!scaled)
@@ -7162,14 +6730,410 @@ void Launcher::ReloadCover(Game* game)
   EnsureCover(game, true);
 }
 
+void Launcher::DrawGradient(const SDL_Rect& rect, SDL_Color first, SDL_Color last, bool horizontal)
+{
+  const float x = (float)rect.x, y = (float)rect.y, w = (float)rect.w, h = (float)rect.h;
+  const SDL_Vertex vertices[] = {{{x, y}, first, {0, 0}},
+                                 {{x + w, y}, horizontal ? last : first, {0, 0}},
+                                 {{x, y + h}, horizontal ? first : last, {0, 0}},
+                                 {{x + w, y + h}, last, {0, 0}}};
+  const int indices[] = {0, 1, 2, 2, 1, 3};
+  SDL_RenderGeometry(m_renderer, nullptr, vertices, 4, indices, 6);
+}
+
+void Launcher::ReloadBackground(Game* game)
+{
+  if (!game)
+    return;
+  if (game->background)
+    SDL_DestroyTexture(game->background);
+  game->background = nullptr;
+  game->background_use = game->background_request = 0;
+  game->background_queued = game->background_attempted = false;
+}
+
+void Launcher::InstallBackground(Game* game, SDL_Texture* texture)
+{
+  int resident = 0;
+  Game* victim = nullptr;
+  for (Game& candidate : m_games)
+  {
+    if (!candidate.background)
+      continue;
+    ++resident;
+    if (candidate.key == m_background_current || candidate.key == m_background_previous ||
+        candidate.key == m_background_target)
+      continue;
+    if (!victim || candidate.background_use < victim->background_use)
+      victim = &candidate;
+  }
+  if (resident >= BACKGROUND_CACHE_LIMIT)
+  {
+    if (!victim)
+    {
+      SDL_DestroyTexture(texture);
+      game->background_attempted = false;
+      return;
+    }
+    ReloadBackground(victim);
+  }
+  game->background = texture;
+  game->background_use = ++m_cover_use;
+}
+
+std::string Launcher::LibraryTabLabel(int tab)
+{
+  static const char* labels[] = {"Recent", "All games", "Favorites"};
+  return tab >= 0 && tab < 3 ? std::string(m_localization.Translate(labels[tab])) : std::string{};
+}
+
+void Launcher::DrawLibraryIcon(LibraryIcon icon, int cx, int cy, int size, SDL_Color color)
+{
+  if (icon == LibraryIcon::Settings)
+  {
+    if (m_settings_icon)
+    {
+      const SDL_Rect rect{cx - size / 2, cy - size / 2, size, size};
+      SDL_SetTextureColorMod(m_settings_icon, color.r, color.g, color.b);
+      SDL_SetTextureAlphaMod(m_settings_icon, color.a);
+      SDL_RenderCopy(m_renderer, m_settings_icon, nullptr, &rect);
+    }
+  }
+  else if (icon == LibraryIcon::Games)
+  {
+    const int cell = std::max(3, size / 4), gap = std::max(2, size / 7);
+    for (int row = 0; row < 2; row++)
+      for (int column = 0; column < 3; column++)
+        RoundedRect(cx - (3 * cell + 2 * gap) / 2 + column * (cell + gap),
+                    cy - (2 * cell + gap) / 2 + row * (cell + gap), cell, cell, 1, color);
+  }
+  else
+  {
+    const int points = icon == LibraryIcon::Favorite ? 10 : 48;
+    const auto point = [&](int index, float radius) {
+      const float angle = index * 6.2831853f / points - 1.5707963f;
+      if (icon == LibraryIcon::Favorite && index % 2)
+        radius *= 0.45f;
+      return SDL_FPoint{cx + std::cos(angle) * radius, cy + std::sin(angle) * radius};
+    };
+    std::array<SDL_Vertex, 288> vertices;
+    int count = 0;
+    for (int i = 0; i < points; i++)
+    {
+      const SDL_FPoint outer = point(i, size * 0.5f), next = point(i + 1, size * 0.5f);
+      if (icon == LibraryIcon::Favorite)
+      {
+        vertices[count++] = {{(float)cx, (float)cy}, color, {0, 0}};
+        vertices[count++] = {outer, color, {0, 0}};
+        vertices[count++] = {next, color, {0, 0}};
+      }
+      else
+      {
+        const SDL_FPoint inner = point(i, size * 0.5f - 2),
+                         innerNext = point(i + 1, size * 0.5f - 2);
+        vertices[count++] = {outer, color, {0, 0}};
+        vertices[count++] = {next, color, {0, 0}};
+        vertices[count++] = {inner, color, {0, 0}};
+        vertices[count++] = {inner, color, {0, 0}};
+        vertices[count++] = {next, color, {0, 0}};
+        vertices[count++] = {innerNext, color, {0, 0}};
+      }
+    }
+    SDL_RenderGeometry(m_renderer, nullptr, vertices.data(), count, nullptr, 0);
+    if (icon == LibraryIcon::Recent)
+    {
+      FillRect(cx - 1, cy - size / 3, 2, size / 3 + 1, color);
+      FillRect(cx, cy - 1, size / 4, 2, color);
+    }
+  }
+}
+
+LibraryHeaderLayout Launcher::ComputeLibraryHeaderLayout()
+{
+  LibraryHeaderLayout layout{};
+  int x = 40;
+  for (int tab = 0; tab < 3; tab++)
+  {
+    const std::string label = LibraryTabLabel(tab);
+    const int width =
+        28 + (int)std::lround((12 + TextWidth(m_font, label)) * m_library_tab_open[tab]);
+    layout.tabs[tab] = {x - 12, 22, width + 24, 48};
+    x += width + 32;
+  }
+  layout.settings = {m_width - 82, 22, 54, 48};
+  return layout;
+}
+
+int Launcher::LibraryHeaderHit(int x, int y)
+{
+  const LibraryHeaderLayout layout = ComputeLibraryHeaderLayout();
+  SDL_Point point{x, y};
+  if (SDL_PointInRect(&point, &layout.settings))
+    return 3;
+  for (size_t index = 0; index < layout.tabs.size(); index++)
+    if (SDL_PointInRect(&point, &layout.tabs[index]))
+      return (int)index;
+  return -1;
+}
+
+void Launcher::DrawLibraryHeader()
+{
+  const Uint32 now = SDL_GetTicks();
+  const float dt = std::min(0.05f, (now - m_library_animation_tick) / 1000.0f);
+  m_library_animation_tick = now;
+  for (int tab = 0; tab < 3; tab++)
+  {
+    const float target = tab == static_cast<int>(m_library_view) ? 1.0f : 0.0f;
+    if (!m_animations)
+      m_library_tab_open[tab] = target;
+    else
+      m_library_tab_open[tab] += (target - m_library_tab_open[tab]) * (1 - std::exp(-18 * dt));
+    if (std::fabs(target - m_library_tab_open[tab]) < 0.004f)
+      m_library_tab_open[tab] = target;
+    else
+      m_interaction_animation_until = now + 100;
+  }
+  DrawGradient({0, 0, m_width, 140}, {0, 0, 0, 110}, {0, 0, 0, 0});
+  const LibraryHeaderLayout layout = ComputeLibraryHeaderLayout();
+  for (int tab = 0; tab < 3; tab++)
+  {
+    const SDL_Rect& rect = layout.tabs[tab];
+    const bool focused = m_library_header_focused && m_library_header_selection == tab;
+    const SDL_Color color = tab == static_cast<int>(m_library_view) || focused ? m_text : m_dim;
+    if (focused)
+      RoundedPanel(rect.x, rect.y, rect.w, rect.h, {255, 255, 255, 8}, m_selection, 14, 2);
+    DrawLibraryIcon(tab == 0 ? LibraryIcon::Recent :
+                    tab == 1 ? LibraryIcon::Games :
+                               LibraryIcon::Favorite,
+                    rect.x + 26, 46, 28, color);
+    if (rect.w > 52)
+    {
+      const SDL_Rect clip{rect.x + 52, rect.y, rect.w - 52, rect.h};
+      SDL_RenderSetClipRect(m_renderer, &clip);
+      DrawText(m_font, clip.x, 46 - FontHeight(m_font) / 2, LibraryTabLabel(tab), color);
+      SDL_RenderSetClipRect(m_renderer, nullptr);
+    }
+  }
+  const bool focused = m_library_header_focused && m_library_header_selection == 3;
+  if (focused)
+    RoundedPanel(layout.settings.x, layout.settings.y, layout.settings.w, layout.settings.h,
+                 {255, 255, 255, 8}, m_selection, 14, 2);
+  DrawLibraryIcon(LibraryIcon::Settings, layout.settings.x + 27, 46, 28, focused ? m_text : m_dim);
+}
+
+RecentLayout Launcher::ComputeRecentLayout() const
+{
+  return {40, 126, 240, 200, 440};
+}
+
+SDL_Rect Launcher::RecentCoverRect(int index, const RecentLayout& layout) const
+{
+  const float slot = index - m_recent_position;
+  const float focus = std::max(0.0f, 1.0f - std::fabs(slot));
+  const int step = layout.width + 18, expanded = layout.focused_width + 16 - step;
+  const int x = layout.x + (int)std::lround(slot * step + std::clamp(slot, 0.0f, 1.0f) * expanded);
+  const int width = layout.width + (int)std::lround((layout.focused_width - layout.width) * focus);
+  return {x, layout.y, width, width * 3 / 2};
+}
+
+SDL_Rect Launcher::LibraryEmptyActionRect() const
+{
+  return {m_width / 2 - 148, m_height / 2 + 82, 296, 48};
+}
+
+void Launcher::DrawLibraryEmpty()
+{
+  const bool scanning = m_library_scan != nullptr && m_games.empty();
+  const char* title = scanning                                 ? "Loading game library..." :
+                      m_library_view == LibraryView::Recent    ? "Nothing played yet" :
+                      m_library_view == LibraryView::Favorites ? "No favorites yet" :
+                                                                 "No games found";
+  const char* description = scanning ? "The first page will appear as soon as it is ready." :
+                            m_library_view == LibraryView::Recent ?
+                                       "Games you launch appear here, most recent first." :
+                            m_library_view == LibraryView::Favorites ?
+                                       "Mark games as favorites from their game menu." :
+                                       "Add game folders in Settings to populate your library.";
+  DrawTextCentered(m_font_large, m_width / 2, m_height / 2 - 80, m_localization.Translate(title),
+                   m_text);
+  DrawWrappedCentered(m_font_small, m_width / 2, m_height / 2 - 22, m_width - 240, 30, 2,
+                      m_localization.Translate(description), m_dim);
+  const SDL_Rect action = LibraryEmptyActionRect();
+  RoundedPanel(action.x, action.y, action.w, action.h, m_focus,
+               m_library_header_focused ? m_dim : m_selection, 12);
+  DrawTextCentered(
+      m_font_small, m_width / 2, action.y + (action.h - FontHeight(m_font_small)) / 2,
+      m_localization.Translate(m_library_view == LibraryView::All ? "Settings" : "All games"),
+      m_text);
+}
+
+void Launcher::DrawBackgroundArtwork(const std::string& key, Uint8 alpha)
+{
+  Game* game = FindGameByKey(key);
+  if (!game || !alpha)
+    return;
+  SDL_Texture* texture = game->background           ? game->background :
+                         game->background_attempted ? game->cover :
+                                                      nullptr;
+  if (!texture)
+    return;
+  if (game->background)
+    game->background_use = ++m_cover_use;
+  else
+    EnsureCover(game);
+  int width = 0, height = 0;
+  SDL_QueryTexture(texture, nullptr, nullptr, &width, &height);
+  if (width < 1 || height < 1)
+    return;
+  SDL_Rect src{0, 0, width, height}, destination{0, 0, m_width, m_height};
+  if ((long long)width * m_height > (long long)height * m_width)
+  {
+    src.w = height * m_width / m_height;
+    src.x = (width - src.w) / 2;
+  }
+  else
+  {
+    src.h = width * m_height / m_width;
+    src.y = (height - src.h) / 2;
+  }
+  SDL_SetTextureColorMod(texture, 205, 205, 205);
+  SDL_SetTextureAlphaMod(texture, alpha);
+  SDL_RenderCopy(m_renderer, texture, &src, &destination);
+  SDL_SetTextureColorMod(texture, 255, 255, 255);
+  SDL_SetTextureAlphaMod(texture, 255);
+}
+
+void Launcher::DrawClassicBackground()
+{
+  Game* target = FindGameByKey(m_background_target);
+  bool ready = !target;
+  if (target)
+  {
+    if (target->background)
+      target->background_use = ++m_cover_use;
+    else
+      QueueCoverDecode(target, true, true);
+    if (target->background_attempted && !target->background)
+      EnsureCover(target, true);
+    ready = target->background ||
+            (target->background_attempted && (target->cover || target->cover_attempted));
+  }
+  if (ready && m_background_current != m_background_target)
+  {
+    m_background_previous = m_background_current;
+    m_background_current = m_background_target;
+    m_background_since = SDL_GetTicks();
+  }
+  const Uint32 elapsed = SDL_GetTicks() - m_background_since;
+  const Uint8 alpha = !m_animations || elapsed >= 300 ? 255 : (Uint8)(elapsed * 255 / 300);
+  if (alpha == 255)
+    m_background_previous.clear();
+  else
+    m_interaction_animation_until = SDL_GetTicks() + 100;
+  DrawBackgroundArtwork(m_background_previous, 255);
+  DrawBackgroundArtwork(m_background_current, alpha);
+  FillRect(0, 0, m_width, m_height, {0, 0, 0, 25});
+  DrawGradient({0, 0, m_width * 2 / 3, m_height}, {0, 0, 0, 120}, {0, 0, 0, 0}, true);
+  DrawGradient({0, m_height / 2, m_width, m_height - m_height / 2}, {0, 0, 0, 0}, {0, 0, 0, 220});
+}
+
+std::string Launcher::BackgroundPath(const Game& game) const
+{
+  return std::string(COVER_DIRECTORY) + "/" + game.key + ".background.png";
+}
+
+std::string Launcher::ArtworkKey(const Game& game, std::string_view field) const
+{
+  return "Artwork/" + game.key + "/" + std::string(field);
+}
+
+Game* Launcher::FindGameByKey(std::string_view key)
+{
+  const auto found = std::ranges::find(m_games, key, &Game::key);
+  return found == m_games.end() ? nullptr : &*found;
+}
+
+int Launcher::VisibleIndexForKey(std::string_view key) const
+{
+  for (std::size_t index = 0; index < m_visible_games.size(); ++index)
+    if (m_games[m_visible_games[index]].key == key)
+      return static_cast<int>(index);
+  return 0;
+}
+
+void Launcher::SelectLibraryTab(int tab, int* selection)
+{
+  if (const Game* game = VisibleGame(*selection))
+    m_library_selections[static_cast<int>(m_library_view)] = game->key;
+  tab = std::clamp(tab, 0, 2);
+  m_library_view = static_cast<LibraryView>(tab);
+  RebuildVisibleGames();
+  *selection = VisibleIndexForKey(m_library_selections[tab]);
+  m_library_header_selection = tab;
+  m_recent_position = -1;
+  BeginScreenFx();
+}
+
+void Launcher::DrawLibraryCover(Game& game, const SDL_Rect& rect, bool selected)
+{
+  const int x = rect.x, y = rect.y, w = rect.w, h = rect.h;
+  EnsureCover(&game, true);
+  FillRect(x + 4, y + 6, w, h, SDL_Color{0, 0, 0, 55});
+  FillRect(x + 2, y + 3, w, h, SDL_Color{0, 0, 0, 70});
+  if (game.cover)
+  {
+    const Uint32 elapsed = SDL_GetTicks() - game.cover_loaded_at;
+    const Uint8 opacity = !m_animations ? 255 : elapsed < 180 ? (Uint8)(255 * elapsed / 180) : 255;
+    SDL_SetTextureAlphaMod(game.cover, opacity);
+    const Uint8 tint = selected ? 255 : 225;
+    SDL_SetTextureColorMod(game.cover, tint, tint, tint);
+    SDL_RenderCopy(m_renderer, game.cover, nullptr, &rect);
+  }
+  else
+  {
+    FillRect(x, y, w, h, m_card);
+    DrawTextCentered(m_font_small, x + w / 2, y + h / 2 - 8,
+                     Ellipsize(m_font_small, m_localization.Translate("NO COVER"), w - 12), m_dim);
+  }
+  Border(x, y, w, h, 1, SDL_Color{12, 13, 18, 255});
+  FillRect(x, y, w, 1, SDL_Color{255, 255, 255, 26});
+  if (selected)
+    Border(x - 3, y - 3, w + 6, h + 6, 2, m_selection);
+  int flag_index = 0;
+  if (game.region == DiscIO::Region::NTSC_U)
+    flag_index = 1;
+  else if (game.region == DiscIO::Region::PAL)
+    flag_index = 2;
+  else if (game.region == DiscIO::Region::NTSC_J || game.region == DiscIO::Region::NTSC_K)
+    flag_index = 3;
+  if (m_show_region_flags && flag_index > 0 && m_flags[flag_index])
+  {
+    const int fw = std::clamp(w * 26 / 100, 16, 30), fh = fw * 2 / 3;
+    SDL_Rect flag{x + 6, y + 6, fw, fh};
+    SDL_RenderCopy(m_renderer, m_flags[flag_index], nullptr, &flag);
+    Border(flag.x, flag.y, fw, fh, 1, SDL_Color{10, 12, 18, 255});
+  }
+  if (m_show_custom_settings_badges && game.has_game_config)
+  {
+    const int size = 26, icon = 18, bx = x + w - size - 6, by = y + 6;
+    RoundedPanel(bx, by, size, size, {8, 12, 24, 232}, {235, 239, 247, 80}, size / 2);
+    DrawLibraryIcon(LibraryIcon::Settings, bx + size / 2, by + size / 2, icon, m_text);
+  }
+  if (m_favorites.count(game.key))
+  {
+    RoundedRect(x + w - 31, y + h - 31, 26, 26, 13, SDL_Color{8, 12, 24, 225});
+    DrawLibraryIcon(LibraryIcon::Favorite, x + w - 18, y + h - 18, 18, m_value);
+  }
+}
+
 int Launcher::GridColumns() const
 {
-  return m_grid_columns;
+  return m_library_view == LibraryView::Recent ? 5 : m_grid_columns;
 }
 
 int Launcher::GridRows() const
 {
-  return m_grid_rows;
+  return m_library_view == LibraryView::Recent ? 1 : m_grid_rows;
 }
 
 int Launcher::GridPageSize() const
@@ -7235,8 +7199,8 @@ GridLayout Launcher::ComputeGridLayout()
   layout.title_height = m_show_titles ? FontHeight(m_font_small) : 0;
   layout.columns = GridColumns();
   layout.rows = GridRows();
-  const int top_bar = TopBarHeight() + 18;
-  const int footer = MeasureFooter(LIBRARY_FOOTER).height + 12;
+  constexpr int top_bar = 112;
+  const int footer = std::max(88, MeasureFooter(LIBRARY_FOOTER).height + 32);
   const int available_height = m_height - top_bar - footer;
   const int caption = layout.title_height ? layout.title_height + 8 : 0;
   const int maximum_cover_height = std::max(
@@ -7258,8 +7222,28 @@ GridLayout Launcher::ComputeGridLayout()
   return layout;
 }
 
-int Launcher::GridHitTest(int x, int y, int page_start)
+int Launcher::GridHitTest(int x, int y, int page_start, int selection)
 {
+  if (m_library_view == LibraryView::Recent)
+  {
+    const RecentLayout layout = ComputeRecentLayout();
+    const SDL_Point point{x, y};
+    if (VisibleGame(selection))
+    {
+      const SDL_Rect rect = RecentCoverRect(selection, layout);
+      if (SDL_PointInRect(&point, &rect))
+        return selection;
+    }
+    const int count = static_cast<int>(m_visible_games.size());
+    for (int index = std::max(0, static_cast<int>(std::floor(m_recent_position)) - 1);
+         index < std::min(count, static_cast<int>(std::ceil(m_recent_position)) + 6); ++index)
+    {
+      const SDL_Rect rect = RecentCoverRect(index, layout);
+      if (SDL_PointInRect(&point, &rect))
+        return index;
+    }
+    return -1;
+  }
   const GridLayout layout = ComputeGridLayout();
   const int caption = layout.title_height ? layout.title_height + 8 : 0;
   const int row_stride = layout.RowStride();
@@ -7282,169 +7266,86 @@ int Launcher::GridHitTest(int x, int y, int page_start)
 
 void Launcher::RenderGrid(int selection)
 {
-  ClearBackground();
   m_cover_decode_budget = COVER_REQUEST_BUDGET;
-  if (Game* selected = VisibleGame(selection))
-    EnsureCover(selected, true);
+  Game* selected = VisibleGame(selection);
+  m_background_target = selected ? selected->key : std::string{};
+  ClearBackground();
+  if (m_theme == Theme::Classic)
+    for (const int direction : {-1, 1})
+      QueueCoverDecode(VisibleGame(selection + direction), false, true);
+  EnsureCover(selected, true);
   const GridLayout layout = ComputeGridLayout();
-  const int row_stride = layout.RowStride();
+  const int count = static_cast<int>(m_visible_games.size());
   const int per_page = GridPageSize();
-  const int page_start = m_visible_games.empty() ? 0 : selection / per_page * per_page;
-  const int page_count = m_visible_games.empty() ?
-                             1 :
-                             (static_cast<int>(m_visible_games.size()) + per_page - 1) / per_page;
-  const int page = m_visible_games.empty() ? 1 : selection / per_page + 1;
-
-  static constexpr std::array<std::string_view, 3> SORT_NAMES = {"A-Z", "Recently played",
-                                                                 "Recently added"};
-  const Game* const selected_game = VisibleGame(selection);
-  const std::string library(m_localization.Translate("Library"));
-  std::string eyebrow = library;
-  if (selected_game)
-    eyebrow += "  ·  " + GameLocationLabel(*selected_game);
-  if (!m_active_collection.empty())
+  const int page_start = count ? selection / per_page * per_page : 0;
+  DrawLibraryHeader();
+  if (count && m_library_view == LibraryView::Recent)
   {
-    eyebrow += "  ·  " + (m_active_collection == "favorites" ?
-                           std::string(m_localization.Translate("Favorites")) :
-                           m_active_collection);
-  }
-  if (!m_search_query.empty())
-    eyebrow += "  ·  " + std::string(m_localization.Translate("Search:")) + " " + m_search_query;
-  const std::string summary =
-      std::to_string(m_visible_games.empty() ? 0 : selection + 1) + " / " +
-      std::to_string(m_visible_games.size()) + "  ·  " +
-      std::string(m_localization.Translate("Page")) + " " + std::to_string(page) + " / " +
-      std::to_string(page_count);
-  const std::string sorting =
-      std::string(m_localization.Translate("Sort:")) + " " +
-      std::string(m_localization.Translate(SORT_NAMES[static_cast<int>(m_sort_mode)]));
-  DrawPageHeader(selected_game ? std::string_view(selected_game->title) :
-                                 std::string_view(library),
-                 eyebrow, summary, sorting);
-
-  const int cover_width = layout.cover_width;
-  const int cover_height = layout.cover_height;
-  for (int row = 0; row < layout.rows; ++row)
-  {
-    for (int column = 0; column < layout.columns; ++column)
-    {
-      const int index = page_start + row * layout.columns + column;
-      if (index >= static_cast<int>(m_visible_games.size()))
-        continue;
-      Game& game = *VisibleGame(index);
-      EnsureCover(&game);
-      const int x = layout.x0 + column * (cover_width + layout.gap_x);
-      const int y = layout.y0 + row * row_stride;
-      const bool current = index == selection;
-      FillRect(x + 4, y + 6, cover_width, cover_height, SDL_Color{0, 0, 0, 55});
-      FillRect(x + 2, y + 3, cover_width, cover_height, SDL_Color{0, 0, 0, 70});
-      if (game.cover)
-      {
-        Uint8 alpha = 255;
-        if (m_animations && SDL_GetTicks() - game.cover_loaded_at < 180)
-          alpha = static_cast<Uint8>((SDL_GetTicks() - game.cover_loaded_at) * 255 / 180);
-        SDL_SetTextureAlphaMod(game.cover, alpha);
-        SDL_SetTextureColorMod(game.cover, current ? 255 : 225, current ? 255 : 225,
-                               current ? 255 : 225);
-        SDL_Rect destination{x, y, cover_width, cover_height};
-        SDL_RenderCopy(m_renderer, game.cover, nullptr, &destination);
-      }
-      else
-      {
-        FillRect(x, y, cover_width, cover_height, m_card);
-        const std::string_view no_cover = m_localization.Translate("NO COVER");
-        const int text_width = cover_width - 16;
-        const int line_height = FontHeight(m_font_small) + 4;
-        const int center_y = y + cover_height / 2;
-        if (TextWidth(m_font_small, no_cover) <= text_width)
-          DrawTextCentered(m_font_small, x + cover_width / 2,
-                           center_y - FontHeight(m_font_small) / 2, no_cover, m_dim);
-        else
-          DrawWrappedCentered(m_font_small, x + cover_width / 2, center_y - line_height, text_width,
-                              line_height, 2, no_cover, m_dim);
-      }
-      Border(x, y, cover_width, cover_height, 1, SDL_Color{12, 13, 18, 255});
-      FillRect(x, y, cover_width, 1, SDL_Color{255, 255, 255, 26});
-      if (current)
-        Border(x - 2, y - 2, cover_width + 4, cover_height + 4, 2, m_selection);
-      int flag_index = 0;
-      if (game.region == DiscIO::Region::NTSC_U)
-        flag_index = 1;
-      else if (game.region == DiscIO::Region::PAL)
-        flag_index = 2;
-      else if (game.region == DiscIO::Region::NTSC_J || game.region == DiscIO::Region::NTSC_K)
-        flag_index = 3;
-      if (m_show_region_flags && flag_index && m_flags[flag_index])
-      {
-        int flag_width = std::clamp(cover_width * 26 / 100, 16, 30);
-        const int flag_height = flag_width * 2 / 3;
-        SDL_Rect flag{x + 6, y + 6, flag_width, flag_height};
-        SDL_RenderCopy(m_renderer, m_flags[flag_index], nullptr, &flag);
-        Border(x + 6, y + 6, flag_width, flag_height, 1, SDL_Color{10, 12, 18, 255});
-      }
-      if (m_show_custom_settings_badges && game.has_game_config)
-      {
-        const int size = std::max(12, cover_width / 11);
-        FillRect(x + cover_width - size - 8, y + 8, size, size, m_selection);
-        Border(x + cover_width - size - 8, y + 8, size, size, 2, SDL_Color{10, 12, 18, 255});
-      }
-      if (m_favorites.contains(game.key))
-        DrawText(m_font_small, x + cover_width - 27, y + 5, "★", m_value);
-      if (m_show_titles)
-        DrawTitleCell(x + cover_width / 2, cover_width, y + cover_height + 6, game, current,
-                      current ? m_value : m_dim);
-    }
-  }
-  // Decode the following page after all visible covers are queued. Page turns therefore avoid
-  // the first-visit stall without allowing a large library to flood memory or the SDL upload path.
-  const int prefetch_start = page_start + per_page;
-  const int prefetch_end =
-      std::min(static_cast<int>(m_visible_games.size()), prefetch_start + per_page);
-  for (int index = prefetch_start; index < prefetch_end; ++index)
-    EnsureCover(VisibleGame(index));
-  if (m_visible_games.empty())
-  {
-    std::string empty_state;
-    if (m_library_scan)
-    {
-      const std::size_t processed = m_library_scan->processed.load(std::memory_order_acquire);
-      const std::size_t discovered = m_library_scan->discovered.load(std::memory_order_acquire);
-      empty_state =
-          discovered ? std::string(m_localization.Translate("Scanning game library...")) + "  " +
-                           std::to_string(processed) + " / " + std::to_string(discovered) :
-                       std::string(m_localization.Translate("Scanning game folders..."));
-    }
+    const RecentLayout recent = ComputeRecentLayout();
+    const float target = static_cast<float>(selection);
+    if (m_recent_position < 0 || !m_animations)
+      m_recent_position = target;
     else
-    {
-      empty_state =
-          m_localization.Translate("No games match this view -- press - to change filters");
-    }
-    const int panel_width = std::min(940, m_width - 64);
-    const int panel_height = std::max(140, FontHeight(m_font) + 96);
-    GlassPanel((m_width - panel_width) / 2, (m_height - panel_height) / 2, panel_width,
-               panel_height);
-    DrawTextCentered(m_font, m_width / 2, (m_height - FontHeight(m_font)) / 2,
-                     Ellipsize(m_font, empty_state, panel_width - 64), m_dim);
+      m_recent_position += (target - m_recent_position) * 0.24f;
+    if (std::fabs(target - m_recent_position) < 0.005f)
+      m_recent_position = target;
+    else
+      m_interaction_animation_until = SDL_GetTicks() + 100;
+    const SDL_Rect clip{0, recent.y - 8, m_width, recent.focused_width * 3 / 2 + 16};
+    SDL_RenderSetClipRect(m_renderer, &clip);
+    for (int index = std::max(0, static_cast<int>(std::floor(m_recent_position)) - 1);
+         index < std::min(count, static_cast<int>(std::ceil(m_recent_position)) + 6); ++index)
+      if (index != selection)
+        DrawLibraryCover(*VisibleGame(index), RecentCoverRect(index, recent), false);
+    const SDL_Rect focused = RecentCoverRect(selection, recent);
+    DrawLibraryCover(*selected, focused, !m_library_header_focused);
+    SDL_RenderSetClipRect(m_renderer, nullptr);
+    const int title_x = focused.x + focused.w + 16;
+    DrawScrollingTextLeft(m_font, title_x, recent.title_y, m_width - 40 - title_x, selected->title,
+                          m_text);
   }
-  DrawUpdateNotification();
-  std::array<std::pair<std::string_view, std::string_view>, LIBRARY_FOOTER.size()> hints{};
-  int hint_count = 0;
-  const bool has_games = !m_visible_games.empty();
-  if (has_games)
-    hints[hint_count++] = {"A", "Launch"};
-  if (has_games)
-    hints[hint_count++] = {"Y", "Sort"};
-  hints[hint_count++] = {"X", "Settings"};
-  if (has_games)
-    hints[hint_count++] = {"+", "Game Menu"};
-  hints[hint_count++] = {"-", "Filter"};
-  if (page_count > 1)
+  else if (count)
   {
-    hints[hint_count++] = {"L", ""};
-    hints[hint_count++] = {"R", "Page"};
+    for (int row = 0; row < layout.rows; ++row)
+      for (int column = 0; column < layout.columns; ++column)
+      {
+        const int index = page_start + row * layout.columns + column;
+        if (index >= count)
+          continue;
+        Game& game = *VisibleGame(index);
+        const SDL_Rect rect{layout.x0 + column * (layout.cover_width + layout.gap_x),
+                            layout.y0 + row * layout.RowStride(), layout.cover_width,
+                            layout.cover_height};
+        const bool current = index == selection && !m_library_header_focused;
+        DrawLibraryCover(game, rect, current);
+        if (m_show_titles)
+          DrawTitleCell(rect.x + rect.w / 2, rect.w, rect.y + rect.h + 6, game, current,
+                        current ? m_value : m_dim);
+      }
+    for (int index = page_start + per_page; index < std::min(count, page_start + per_page * 2);
+         ++index)
+      EnsureCover(VisibleGame(index));
   }
-  hints[hint_count++] = {"B", "Quit"};
-  DrawFooter(std::span(hints).first(hint_count));
+  else
+    DrawLibraryEmpty();
+  DrawUpdateNotification();
+  if (m_library_header_focused)
+  {
+    const std::array<std::pair<std::string_view, std::string_view>, 2> hints = {
+        std::pair{"A", m_library_header_selection == 3 ? "Settings" : "Open"},
+        std::pair{"B", "Back"}};
+    DrawFooter(hints, m_height - 50);
+  }
+  else if (count)
+    DrawFooter(LIBRARY_FOOTER, m_height - 50);
+  else
+  {
+    const std::array<std::pair<std::string_view, std::string_view>, 2> hints = {
+        std::pair{"A", m_library_view == LibraryView::All ? "Settings" : "All games"},
+        std::pair{"B", "Quit"}};
+    DrawFooter(hints, m_height - 50);
+  }
+  DrawFadeIn();
   SDL_RenderPresent(m_renderer);
 }
 
@@ -7535,29 +7436,16 @@ void Launcher::InvalidateGameSettingCache(const Game& game) const
     m_game_ini_cache.erase(shared_path);
 }
 
-std::string Launcher::GlobalValueLabel(std::string_view value) const
-{
-  return std::string(m_localization.Translate("Global")) + ": " +
-         std::string(m_localization.Translate(value));
-}
-
-std::string Launcher::UseGlobalValueLabel(std::string_view value) const
-{
-  return std::string(m_localization.Translate("Use global")) + " (" +
-         std::string(m_localization.Translate(value)) + ")";
-}
-
 std::string Launcher::PerGameBoolLabel(const Game& game, std::string_view section,
                                        std::string_view key, bool global, bool inverted) const
 {
-  const std::optional<std::string> local = GetGameSetting(game, section, key);
-  if (!local)
+  const auto local = GetGameSetting(game, section, key);
+  bool value = global;
+  if (local)
   {
-    const bool value = inverted ? !global : global;
-    return GlobalValueLabel(value ? "On" : "Off");
+    const std::string normalized = Lower(*local);
+    value = normalized == "true" || normalized == "1" || normalized == "yes";
   }
-  const std::string normalized = Lower(*local);
-  bool value = normalized == "true" || normalized == "1" || normalized == "yes";
   if (inverted)
     value = !value;
   return value ? "On" : "Off";
@@ -7567,39 +7455,20 @@ void Launcher::EditPerGameBool(Game& game, std::string_view title, std::string_v
                                std::string_view key, bool global, int delta,
                                std::string_view on_label, std::string_view off_label, bool inverted)
 {
-  const std::optional<std::string> local = GetGameSetting(game, section, key);
-  int selected = 0;
+  const auto local = GetGameSetting(game, section, key);
+  bool value = global;
   if (local)
   {
     const std::string normalized = Lower(*local);
-    bool value = normalized == "true" || normalized == "1" || normalized == "yes";
-    if (inverted)
-      value = !value;
-    selected = value ? 1 : 2;
+    value = normalized == "true" || normalized == "1" || normalized == "yes";
   }
-
-  if (delta == 0)
-  {
-    const bool global_value = inverted ? !global : global;
-    selected = Dropdown(std::string(title),
-                        {UseGlobalValueLabel(global_value ? on_label : off_label),
-                         std::string(on_label), std::string(off_label)},
-                        selected);
-  }
-  else
-  {
-    selected = (selected + (delta < 0 ? -1 : 1) + 3) % 3;
-  }
-
-  if (selected == 0)
-    SetGameSetting(game, section, key, std::nullopt);
-  else
-  {
-    bool value = selected == 1;
-    if (inverted)
-      value = !value;
-    SetGameSetting(game, section, key, value ? "True" : "False");
-  }
+  if (inverted)
+    value = !value;
+  const std::array<std::string_view, 2> labels = {on_label, off_label};
+  value = SelectChoice(title, labels, value ? 0 : 1, delta) == 0;
+  if (inverted)
+    value = !value;
+  SetGameSetting(game, section, key, value ? "True" : "False");
 }
 
 void Launcher::EmulationSettings(bool per_game, Game* game)
@@ -7640,10 +7509,6 @@ void Launcher::EmulationSettings(bool per_game, Game* game)
           if (iterator != CPU_VALUES.end())
             cpu_label = std::string(CPU_LABELS[iterator - CPU_VALUES.begin()]);
         }
-        else if (per_game)
-        {
-          cpu_label = GlobalValueLabel(cpu_label);
-        }
         const float global_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
         int speed_index = 0;
         for (int index = 0; index < static_cast<int>(SPEED_VALUES.size()); ++index)
@@ -7656,10 +7521,6 @@ void Launcher::EmulationSettings(bool per_game, Game* game)
           for (int index = 0; index < static_cast<int>(SPEED_VALUES.size()); ++index)
             if (std::abs(parsed - SPEED_VALUES[index]) < 0.01f)
               speed_label = SPEED_LABELS[index];
-        }
-        else if (per_game)
-        {
-          speed_label = GlobalValueLabel(speed_label);
         }
         return std::vector<Row>{
             {"CPU engine", cpu_label, !per_game || (game && !game->game_id.empty())},
@@ -7686,19 +7547,9 @@ void Launcher::EmulationSettings(bool per_game, Game* game)
           }
           if (per_game)
           {
-            std::vector<std::string> choices{UseGlobalValueLabel(CPU_LABELS[global])};
-            for (const std::string_view label : CPU_LABELS)
-              choices.emplace_back(label);
-            int selected = local ? current + 1 : 0;
-            if (delta == 0)
-              selected = Dropdown("CPU engine", choices, selected);
-            else
-              selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(choices.size())) %
-                         static_cast<int>(choices.size());
-            if (selected == 0)
-              SetGameSetting(*game, "Core", "CPUCore", std::nullopt);
-            else
-              SetGameSetting(*game, "Core", "CPUCore", std::to_string(CPU_VALUES[selected - 1]));
+            const int selected = SelectChoice("CPU engine", CPU_LABELS, current, delta);
+            if (selected != current)
+              SetGameSetting(*game, "Core", "CPUCore", std::to_string(CPU_VALUES[selected]));
           }
           else
           {
@@ -7754,20 +7605,10 @@ void Launcher::EmulationSettings(bool per_game, Game* game)
           }
           if (per_game)
           {
-            std::vector<std::string> choices{UseGlobalValueLabel(SPEED_LABELS[global])};
-            for (const std::string_view label : SPEED_LABELS)
-              choices.emplace_back(label);
-            int selected = local ? current + 1 : 0;
-            if (delta == 0)
-              selected = Dropdown("Emulation speed", choices, selected);
-            else
-              selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(choices.size())) %
-                         static_cast<int>(choices.size());
-            if (selected == 0)
-              SetGameSetting(*game, "Core", "EmulationSpeed", std::nullopt);
-            else
+            const int selected = SelectChoice("Emulation speed", SPEED_LABELS, current, delta);
+            if (selected != current)
               SetGameSetting(*game, "Core", "EmulationSpeed",
-                             std::to_string(SPEED_VALUES[selected - 1]));
+                             std::to_string(SPEED_VALUES[selected]));
           }
           else
           {
@@ -7824,7 +7665,7 @@ void Launcher::AdvancedEmulationSettings(bool per_game, Game* game)
     const float effective_value = local ? std::strtof(local->c_str(), nullptr) : global;
     const int percent = std::clamp(static_cast<int>(std::lround(effective_value * 100.0f)), 1, 500);
     const std::string label = std::to_string(percent) + "%";
-    return per_game && !local ? GlobalValueLabel(label) : label;
+    return label;
   };
   const auto edit_percent = [&](std::string_view title, std::string_view key,
                                 const Config::Info<float>& info, int delta) {
@@ -7852,28 +7693,22 @@ void Launcher::AdvancedEmulationSettings(bool per_game, Game* game)
                             std::to_string(value) + "%";
     };
     std::vector<std::string> choices;
-    choices.reserve(values.size() + (per_game ? 1 : 0));
-    if (per_game)
-      choices.push_back(UseGlobalValueLabel(format(global_percent)));
+    choices.reserve(values.size());
     for (const int value : values)
       choices.push_back(format(value));
 
     int selected = static_cast<int>(std::ranges::find(values, percent) - values.begin());
-    if (per_game)
-      selected = local ? selected + 1 : 0;
+    const int previous = selected;
     if (delta == 0)
       selected = Dropdown(title, choices, selected, true, false);
     else
       selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(choices.size())) %
                  static_cast<int>(choices.size());
+    if (per_game && selected == previous)
+      return;
     if (selected < 0)
       return;
-    if (per_game && selected == 0)
-    {
-      SetGameSetting(*game, "Core", key, std::nullopt);
-      return;
-    }
-    percent = values[per_game ? selected - 1 : selected];
+    percent = values[selected];
     const float value = static_cast<float>(percent) / 100.0f;
     if (per_game)
       SetGameSetting(*game, "Core", key, std::to_string(value));
@@ -8046,10 +7881,6 @@ void Launcher::GraphicsSettings(bool per_game, Game* game)
     return value == "OGL" ? (use_zink ? 2 : 1) : 0;
 #endif
   };
-  const auto global_backend_index = [&] {
-    return backend_index(Config::Get(Config::MAIN_GFX_BACKEND),
-                         Config::Get(Config::GFX_SWITCH_USE_ZINK));
-  };
   const auto effective_backend_index = [&] {
     const std::optional<std::string> local_backend = get("Core", "GFXBackend");
     const std::optional<std::string> local_zink = get("Video_Settings", "SwitchUseZink");
@@ -8064,11 +7895,8 @@ void Launcher::GraphicsSettings(bool per_game, Game* game)
     return backend == 1 || backend == 2;
   };
   const auto backend_display = [&] {
-    const bool has_local = get("Core", "GFXBackend").has_value() ||
-                           get("Video_Settings", "SwitchUseZink").has_value();
     const int selected = effective_backend_index();
-    return per_game && !has_local ? GlobalValueLabel(BACKEND_LABELS[selected]) :
-                                    std::string(BACKEND_LABELS[selected]);
+    return std::string(BACKEND_LABELS[selected]);
   };
   const auto display_choice = [&](std::string_view section, std::string_view key, int global,
                                   std::span<const std::string_view> labels,
@@ -8084,7 +7912,7 @@ void Launcher::GraphicsSettings(bool per_game, Game* game)
         selected = iterator - values.begin();
       return std::string(labels[selected]);
     }
-    return per_game ? GlobalValueLabel(labels[selected]) : std::string(labels[selected]);
+    return std::string(labels[selected]);
   };
   const auto bool_display = [&](std::string_view section, std::string_view key, bool global) {
     return per_game ? PerGameBoolLabel(*game, section, key, global) :
@@ -8104,29 +7932,10 @@ void Launcher::GraphicsSettings(bool per_game, Game* game)
           if (iterator != values.end())
             selected = iterator - values.begin();
         }
-        if (per_game)
-        {
-          std::vector<std::string> choices{UseGlobalValueLabel(labels[global_selected])};
-          for (const std::string_view label : labels)
-            choices.emplace_back(label);
-          int choice = local ? selected + 1 : 0;
-          if (delta == 0)
-            choice = Dropdown(title, choices, choice);
-          else
-            choice = (choice + (delta < 0 ? -1 : 1) + static_cast<int>(choices.size())) %
-                     static_cast<int>(choices.size());
-          if (choice == 0)
-          {
-            SetGameSetting(*game, section, key, std::nullopt);
-            return values[global_selected];
-          }
-          selected = choice - 1;
+        const int previous = selected;
+        selected = SelectChoice(title, labels, selected, delta);
+        if (per_game && selected != previous)
           SetGameSetting(*game, section, key, std::to_string(values[selected]));
-        }
-        else
-        {
-          selected = SelectChoice(title, labels, selected, delta);
-        }
         return values[selected];
       };
   const std::array<int, 4> aspect_values = {0, 1, 2, 3};
@@ -8175,47 +7984,20 @@ void Launcher::GraphicsSettings(bool per_game, Game* game)
       [&](int index, int delta) {
         if (index == 0)
         {
-          const std::optional<std::string> local_backend = get("Core", "GFXBackend");
-          const std::optional<std::string> local_zink =
-              get("Video_Settings", "SwitchUseZink");
-          const bool has_local = local_backend.has_value() || local_zink.has_value();
-          const int current_global_backend = global_backend_index();
-          int selected = effective_backend_index();
+          const int current = effective_backend_index();
+          const int selected = SelectChoice("Video backend", BACKEND_LABELS, current, delta);
+          if (per_game && selected == current)
+            return false;
+          const std::string backend = selected == 3 ? "Deko3D" : selected == 0 ? "Vulkan" : "OGL";
           if (per_game)
           {
-            std::vector<std::string> choices{
-                UseGlobalValueLabel(BACKEND_LABELS[current_global_backend])};
-            for (const std::string_view label : BACKEND_LABELS)
-              choices.emplace_back(label);
-            int choice = has_local ? selected + 1 : 0;
-            if (delta == 0)
-              choice = Dropdown("Video backend", choices, choice);
-            else
-              choice = (choice + (delta < 0 ? -1 : 1) + static_cast<int>(choices.size())) %
-                       static_cast<int>(choices.size());
-            if (choice == 0)
-            {
-              SetGameSettings(*game,
-                              {{"Core", "GFXBackend", std::nullopt},
-                               {"Video_Settings", "SwitchUseZink", std::nullopt}});
-            }
-            else
-            {
-              selected = choice - 1;
-              SetGameSettings(*game, {{"Core", "GFXBackend",
-                                       std::string(selected == 3 ? "Deko3D" :
-                                                   selected == 0 ? "Vulkan" :
-                                                                   "OGL")},
-                                      {"Video_Settings", "SwitchUseZink",
-                                       std::string(selected == 2 ? "True" : "False")}});
-            }
+            SetGameSettings(*game, {{"Core", "GFXBackend", backend},
+                                    {"Video_Settings", "SwitchUseZink",
+                                     std::string(selected == 2 ? "True" : "False")}});
           }
           else
           {
-            selected = SelectChoice("Video backend", BACKEND_LABELS, selected, delta);
-            Config::SetBase(Config::MAIN_GFX_BACKEND, std::string(selected == 3 ? "Deko3D" :
-                                                                  selected == 0 ? "Vulkan" :
-                                                                                  "OGL"));
+            Config::SetBase(Config::MAIN_GFX_BACKEND, backend);
             Config::SetBase(Config::GFX_SWITCH_USE_ZINK, selected == 2);
             MarkConfigDirty();
           }
@@ -8558,10 +8340,7 @@ void Launcher::FrameGenerationSettings(bool per_game, Game* game)
                                          Config::Get(Config::GFX_LSFG_ENABLED)) :
                         std::string(enabled ? "On" : "Off"),
              ready || enabled},
-            {"Flow resolution",
-             per_game && !local("LSFGFlowScale") ? GlobalValueLabel(flow_label(flow)) :
-                                                   flow_label(flow),
-             ready && enabled},
+            {"Flow resolution", flow_label(flow), ready && enabled},
             {"Performance mode",
              per_game ? PerGameBoolLabel(*game, "Video_Settings", "LSFGPerformanceMode",
                                          Config::Get(Config::GFX_LSFG_PERFORMANCE_MODE)) :
@@ -8594,28 +8373,14 @@ void Launcher::FrameGenerationSettings(bool per_game, Game* game)
         }
         else if (index == 1)
         {
-          const float global = normalize_flow(Config::Get(Config::GFX_LSFG_FLOW_SCALE));
-          const float current = effective_flow();
+          const std::array<std::string_view, 2> labels = {"Quarter (recommended)", "Half"};
+          const int selected =
+              SelectChoice("Flow resolution", labels, effective_flow() > 0.375f ? 1 : 0, delta);
           if (per_game)
-          {
-            const std::optional<std::string> current_local = local("LSFGFlowScale");
-            std::vector<std::string> choices{UseGlobalValueLabel(flow_label(global)),
-                                             "Quarter (recommended)", "Half"};
-            int selected = current_local ? (current > 0.375f ? 2 : 1) : 0;
-            selected = delta == 0 ? Dropdown("Flow resolution", choices, selected) :
-                                    (selected + (delta < 0 ? -1 : 1) + 3) % 3;
-            if (selected == 0)
-              SetGameSetting(*game, "Video_Settings", "LSFGFlowScale", std::nullopt);
-            else
-              SetGameSetting(*game, "Video_Settings", "LSFGFlowScale",
-                             selected == 1 ? "0.25" : "0.5");
-          }
+            SetGameSetting(*game, "Video_Settings", "LSFGFlowScale",
+                           selected == 0 ? "0.25" : "0.5");
           else
           {
-            int selected = current > 0.375f ? 1 : 0;
-            selected = delta == 0 ? Dropdown("Flow resolution", {"Quarter (recommended)", "Half"},
-                                             selected) :
-                                    (selected + (delta < 0 ? -1 : 1) + 2) % 2;
             Config::SetBase(Config::GFX_LSFG_FLOW_SCALE, selected == 0 ? 0.25f : 0.5f);
             MarkConfigDirty();
           }
@@ -8767,7 +8532,7 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
     const auto local = get(section, key);
     const int value = std::clamp(local ? std::atoi(local->c_str()) : global, 0,
                                  static_cast<int>(labels.size()) - 1);
-    return per_game && !local ? GlobalValueLabel(labels[value]) : std::string(labels[value]);
+    return std::string(labels[value]);
   };
   const auto float_label = [&](std::string_view section, std::string_view key, float global,
                                int decimals) {
@@ -8775,7 +8540,7 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
     const float value = local ? std::strtof(local->c_str(), nullptr) : global;
     char formatted[32]{};
     std::snprintf(formatted, sizeof(formatted), decimals == 1 ? "%.1f" : "%.2f", value);
-    return per_game && !local ? GlobalValueLabel(formatted) : std::string(formatted);
+    return std::string(formatted);
   };
   const auto edit_float = [&](std::string_view title, std::string_view section,
                               std::string_view key, const Config::Info<float>& info, float minimum,
@@ -8810,30 +8575,24 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
       return std::string(text) + std::string(suffix);
     };
     std::vector<std::string> choices;
-    choices.reserve(values.size() + (per_game ? 1 : 0));
-    if (per_game)
-      choices.push_back(UseGlobalValueLabel(format(global)));
+    choices.reserve(values.size());
     for (const float preset : values)
       choices.push_back(format(preset));
 
     const auto current = std::ranges::find_if(
         values, [&](float preset) { return std::abs(preset - value) < 0.0005f; });
     int selected = static_cast<int>(current - values.begin());
-    if (per_game)
-      selected = local ? selected + 1 : 0;
+    const int previous = selected;
     if (delta == 0)
       selected = Dropdown(title, choices, selected, true, false);
     else
       selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(choices.size())) %
                  static_cast<int>(choices.size());
+    if (per_game && selected == previous)
+      return;
     if (selected < 0)
       return;
-    if (per_game && selected == 0)
-    {
-      SetGameSetting(*game, section, key, std::nullopt);
-      return;
-    }
-    value = values[per_game ? selected - 1 : selected];
+    value = values[selected];
     if (per_game)
       SetGameSetting(*game, section, key, std::to_string(value));
     else
@@ -8855,9 +8614,7 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
                                 static_cast<u32>(std::max(1, std::atoi(local_samples->c_str()))) :
                                 global_samples;
         const bool ssaa = parse_bool(local_ssaa, global_ssaa);
-        const bool local_aa = local_samples.has_value() || local_ssaa.has_value();
-        const std::string aa_value = aa_choices[aa_index(samples, ssaa)].label;
-        const std::string aa = per_game && !local_aa ? GlobalValueLabel(aa_value) : aa_value;
+        const std::string aa = aa_choices[aa_index(samples, ssaa)].label;
 
         const auto global_anisotropy = Config::Get(Config::GFX_ENHANCE_MAX_ANISOTROPY);
         const auto global_filtering = Config::Get(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING);
@@ -8871,7 +8628,6 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
             local_filtering ?
                 static_cast<TextureFilteringMode>(std::atoi(local_filtering->c_str())) :
                 global_filtering;
-        const bool local_texture = local_anisotropy.has_value() || local_filtering.has_value();
         const bool fast_sampling =
             effective_bool("Video_Hacks", "FastTextureSampling",
                            Config::Get(Config::GFX_HACK_FAST_TEXTURE_SAMPLING));
@@ -8909,20 +8665,14 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
         std::vector<Row> rows{
             {"Anti-aliasing", aa, aa_choices.size() > 1},
             {"Texture filtering",
-             fast_sampling ? (per_game && !local_texture ?
-                                  GlobalValueLabel(FILTERING_CHOICES[filter_index].label) :
-                                  std::string(FILTERING_CHOICES[filter_index].label)) :
+             fast_sampling ? std::string(FILTERING_CHOICES[filter_index].label) :
                              "Disabled by Manual Texture Sampling",
              fast_sampling},
             {"Output resampling",
              choice_label("Video_Enhancements", "OutputResampling", global_resampling,
                           RESAMPLING_LABELS),
              g_backend_info.bSupportsPostProcessing},
-            {"Post-processing effect",
-             per_game && !local_shader ?
-                 GlobalValueLabel(shader_label.empty() ? std::string_view("Off") :
-                                                         std::string_view(shader_label)) :
-                 (shader_label.empty() ? std::string("Off") : shader_label),
+            {"Post-processing effect", (shader_label.empty() ? std::string("Off") : shader_label),
              g_backend_info.bSupportsPostProcessing},
             {"Scaled EFB copy", bool_label("Video_Hacks", "EFBScaledCopy",
                                            Config::Get(Config::GFX_HACK_COPY_EFB_SCALED))},
@@ -8957,9 +8707,7 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
              float_label("GFX.ColorCorrection", "GameGamma", Config::Get(Config::GFX_CC_GAME_GAMMA),
                          2),
              g_backend_info.bSupportsPostProcessing},
-            {"Display gamma",
-             per_game && !local_display_gamma ? GlobalValueLabel(display_srgb ? "sRGB" : "Custom") :
-                                                std::string(display_srgb ? "sRGB" : "Custom"),
+            {"Display gamma", std::string(display_srgb ? "sRGB" : "Custom"),
              g_backend_info.bSupportsPostProcessing && correct_gamma},
             {"Custom display gamma",
              float_label("GFX.ColorCorrection", "SDRDisplayCustomGamma",
@@ -9012,44 +8760,28 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
           const bool ssaa = parse_bool(local_ssaa, global_ssaa);
           std::vector<std::string> labels;
           int selected = aa_index(samples, ssaa);
-          if (per_game)
-          {
-            labels.push_back(
-                UseGlobalValueLabel(aa_choices[aa_index(global_samples, global_ssaa)].label));
-            for (const AAChoice& choice : aa_choices)
-              labels.push_back(choice.label);
-            selected = local_samples || local_ssaa ? selected + 1 : 0;
-          }
-          else
-          {
-            for (const AAChoice& choice : aa_choices)
-              labels.push_back(choice.label);
-          }
+          for (const AAChoice& choice : aa_choices)
+            labels.push_back(choice.label);
+          const int previous = selected;
           if (delta == 0)
             selected = Dropdown("Anti-aliasing", labels, selected, true, false);
           else
             selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(labels.size())) %
                        static_cast<int>(labels.size());
-          if (per_game && selected == 0)
+          if (per_game && selected == previous)
+            return false;
+          const AAChoice& choice = aa_choices[selected];
+          if (per_game)
           {
-            SetGameSettings(*game, {{"Video_Settings", "MSAA", std::nullopt},
-                                    {"Video_Settings", "SSAA", std::nullopt}});
+            SetGameSettings(*game, {{"Video_Settings", "MSAA", std::to_string(choice.samples)},
+                                    {"Video_Settings", "SSAA", choice.ssaa ? "True" : "False"}});
           }
           else
           {
-            const AAChoice& choice = aa_choices[per_game ? selected - 1 : selected];
-            if (per_game)
-            {
-              SetGameSettings(*game, {{"Video_Settings", "MSAA", std::to_string(choice.samples)},
-                                      {"Video_Settings", "SSAA", choice.ssaa ? "True" : "False"}});
-            }
-            else
-            {
-              Config::ConfigChangeCallbackGuard guard;
-              Config::SetBase(Config::GFX_MSAA, choice.samples);
-              Config::SetBase(Config::GFX_SSAA, choice.ssaa);
-              MarkConfigDirty();
-            }
+            Config::ConfigChangeCallbackGuard guard;
+            Config::SetBase(Config::GFX_MSAA, choice.samples);
+            Config::SetBase(Config::GFX_SSAA, choice.ssaa);
+            MarkConfigDirty();
           }
         }
         else if (index == 1)
@@ -9068,46 +8800,30 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
                   global_filtering;
           std::vector<std::string> labels;
           int selected = filtering_index(anisotropy, filtering);
-          if (per_game)
-          {
-            labels.push_back(UseGlobalValueLabel(
-                FILTERING_CHOICES[filtering_index(global_anisotropy, global_filtering)].label));
-            for (const auto& choice : FILTERING_CHOICES)
-              labels.emplace_back(choice.label);
-            selected = local_anisotropy || local_filtering ? selected + 1 : 0;
-          }
-          else
-          {
-            for (const auto& choice : FILTERING_CHOICES)
-              labels.emplace_back(choice.label);
-          }
+          for (const auto& choice : FILTERING_CHOICES)
+            labels.emplace_back(choice.label);
+          const int previous = selected;
           if (delta == 0)
             selected = Dropdown("Texture filtering", labels, selected);
           else
             selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(labels.size())) %
                        static_cast<int>(labels.size());
-          if (per_game && selected == 0)
+          if (per_game && selected == previous)
+            return false;
+          const FilteringChoice& choice = FILTERING_CHOICES[selected];
+          if (per_game)
           {
-            SetGameSettings(*game, {{"Video_Enhancements", "MaxAnisotropy", std::nullopt},
-                                    {"Video_Enhancements", "ForceTextureFiltering", std::nullopt}});
+            SetGameSettings(*game, {{"Video_Enhancements", "MaxAnisotropy",
+                                     std::to_string(static_cast<int>(choice.anisotropy))},
+                                    {"Video_Enhancements", "ForceTextureFiltering",
+                                     std::to_string(static_cast<int>(choice.filtering))}});
           }
           else
           {
-            const FilteringChoice& choice = FILTERING_CHOICES[per_game ? selected - 1 : selected];
-            if (per_game)
-            {
-              SetGameSettings(*game, {{"Video_Enhancements", "MaxAnisotropy",
-                                       std::to_string(static_cast<int>(choice.anisotropy))},
-                                      {"Video_Enhancements", "ForceTextureFiltering",
-                                       std::to_string(static_cast<int>(choice.filtering))}});
-            }
-            else
-            {
-              Config::ConfigChangeCallbackGuard guard;
-              Config::SetBase(Config::GFX_ENHANCE_MAX_ANISOTROPY, choice.anisotropy);
-              Config::SetBase(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING, choice.filtering);
-              MarkConfigDirty();
-            }
+            Config::ConfigChangeCallbackGuard guard;
+            Config::SetBase(Config::GFX_ENHANCE_MAX_ANISOTROPY, choice.anisotropy);
+            Config::SetBase(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING, choice.filtering);
+            MarkConfigDirty();
           }
         }
         else if (index == 2)
@@ -9117,28 +8833,19 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
           const auto local = get("Video_Enhancements", "OutputResampling");
           int selected = std::clamp(local ? std::atoi(local->c_str()) : global, 0, 6);
           std::vector<std::string> labels;
-          if (per_game)
-          {
-            labels.push_back(UseGlobalValueLabel(RESAMPLING_LABELS[global]));
-            for (const auto label : RESAMPLING_LABELS)
-              labels.emplace_back(label);
-            selected = local ? selected + 1 : 0;
-          }
-          else
-          {
-            for (const auto label : RESAMPLING_LABELS)
-              labels.emplace_back(label);
-          }
+          for (const auto label : RESAMPLING_LABELS)
+            labels.emplace_back(label);
+          const int previous = selected;
           if (delta == 0)
             selected = Dropdown("Output resampling", labels, selected);
           else
             selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(labels.size())) %
                        static_cast<int>(labels.size());
+          if (per_game && selected == previous)
+            return false;
           if (per_game)
             SetGameSetting(*game, "Video_Enhancements", "OutputResampling",
-                           selected == 0 ?
-                               std::nullopt :
-                               std::optional<std::string>{std::to_string(selected - 1)});
+                           std::to_string(selected));
           else
           {
             Config::SetBase(Config::GFX_ENHANCE_OUTPUT_RESAMPLING,
@@ -9158,32 +8865,18 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
           }
           int selected = static_cast<int>(std::ranges::find(post_shader_values, current) -
                                           post_shader_values.begin());
-          std::vector<std::string> labels;
-          if (per_game)
-          {
-            const auto global_iterator = std::ranges::find(post_shader_values, global);
-            const int global_index =
-                global_iterator == post_shader_values.end() ?
-                    0 :
-                    static_cast<int>(global_iterator - post_shader_values.begin());
-            labels.push_back(UseGlobalValueLabel(post_shader_labels[global_index]));
-            labels.insert(labels.end(), post_shader_labels.begin(), post_shader_labels.end());
-            selected = local ? selected + 1 : 0;
-          }
-          else
-          {
-            labels = post_shader_labels;
-          }
+          const std::vector<std::string>& labels = post_shader_labels;
+          const int previous = selected;
           if (delta == 0)
             selected = Dropdown("Post-processing effect", labels, selected, true, false);
           else
             selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(labels.size())) %
                        static_cast<int>(labels.size());
+          if (per_game && selected == previous)
+            return false;
           if (per_game)
             SetGameSetting(*game, "Video_Enhancements", "PostProcessingShader",
-                           selected == 0 ?
-                               std::nullopt :
-                               std::optional<std::string>{post_shader_values[selected - 1]});
+                           post_shader_values[selected]);
           else
           {
             Config::SetBase(Config::GFX_ENHANCE_POST_SHADER, post_shader_values[selected]);
@@ -9243,28 +8936,19 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
           const auto local = get("GFX.ColorCorrection", "GameColorSpace");
           int selected = std::clamp(local ? std::atoi(local->c_str()) : global, 0, 2);
           std::vector<std::string> choices;
-          if (per_game)
-          {
-            choices.push_back(UseGlobalValueLabel(COLOR_SPACE_LABELS[global]));
-            for (const auto label : COLOR_SPACE_LABELS)
-              choices.emplace_back(label);
-            selected = local ? selected + 1 : 0;
-          }
-          else
-          {
-            for (const auto label : COLOR_SPACE_LABELS)
-              choices.emplace_back(label);
-          }
+          for (const auto label : COLOR_SPACE_LABELS)
+            choices.emplace_back(label);
+          const int previous = selected;
           if (delta == 0)
             selected = Dropdown("Game color space", choices, selected);
           else
             selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(choices.size())) %
                        static_cast<int>(choices.size());
+          if (per_game && selected == previous)
+            return false;
           if (per_game)
             SetGameSetting(*game, "GFX.ColorCorrection", "GameColorSpace",
-                           selected == 0 ?
-                               std::nullopt :
-                               std::optional<std::string>{std::to_string(selected - 1)});
+                           std::to_string(selected));
           else
           {
             Config::SetBase(Config::GFX_CC_GAME_COLOR_SPACE,
@@ -9316,29 +9000,19 @@ void Launcher::GraphicsEnhancementsSettings(bool per_game, Game* game)
           const auto local = get("Video_Stereoscopy", "StereoMode");
           int selected = std::clamp(local ? std::atoi(local->c_str()) : global, 0, 5);
           std::vector<std::string> choices;
-          if (per_game)
-          {
-            choices.push_back(UseGlobalValueLabel(STEREO_MODE_LABELS[global]));
-            for (const std::string_view label : STEREO_MODE_LABELS)
-              choices.emplace_back(label);
-            selected = local ? selected + 1 : 0;
-          }
-          else
-          {
-            for (const std::string_view label : STEREO_MODE_LABELS)
-              choices.emplace_back(label);
-          }
+          for (const std::string_view label : STEREO_MODE_LABELS)
+            choices.emplace_back(label);
+          const int previous = selected;
           if (delta == 0)
             selected = Dropdown("Stereoscopic 3D mode", choices, selected);
           else
             selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(choices.size())) %
                        static_cast<int>(choices.size());
+          if (per_game && selected == previous)
+            return false;
           if (per_game)
           {
-            SetGameSetting(*game, "Video_Stereoscopy", "StereoMode",
-                           selected == 0 ?
-                               std::nullopt :
-                               std::optional<std::string>{std::to_string(selected - 1)});
+            SetGameSetting(*game, "Video_Stereoscopy", "StereoMode", std::to_string(selected));
           }
           else
           {
@@ -9559,8 +9233,6 @@ void Launcher::GraphicsHacksSettings(bool per_game, Game* game)
                         value == 128 ? "Default (128)" :
                         value == 512 ? "Fast (512)" :
                                        "Custom (" + std::to_string(value) + ")";
-    if (per_game && !local)
-      label = GlobalValueLabel(label);
     return label;
   };
 
@@ -9644,27 +9316,21 @@ void Launcher::GraphicsHacksSettings(bool per_game, Game* game)
                                         std::to_string(samples) + ")";
           };
           std::vector<std::string> choices;
-          choices.reserve(values.size() + (per_game ? 1 : 0));
-          if (per_game)
-            choices.push_back(UseGlobalValueLabel(format(global)));
+          choices.reserve(values.size());
           for (const int samples : values)
             choices.push_back(format(samples));
           int selected = static_cast<int>(std::ranges::find(values, value) - values.begin());
-          if (per_game)
-            selected = local ? selected + 1 : 0;
+          const int previous = selected;
           if (delta == 0)
             selected = Dropdown("Texture cache accuracy", choices, selected, true, false);
           else
             selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(choices.size())) %
                        static_cast<int>(choices.size());
+          if (per_game && selected == previous)
+            return false;
           if (selected < 0)
             return false;
-          if (per_game && selected == 0)
-          {
-            SetGameSetting(*game, "Video_Settings", "SafeTextureCacheColorSamples", std::nullopt);
-            return false;
-          }
-          value = values[per_game ? selected - 1 : selected];
+          value = values[selected];
           if (per_game)
             SetGameSetting(*game, "Video_Settings", "SafeTextureCacheColorSamples",
                            std::to_string(value));
@@ -9751,13 +9417,13 @@ void Launcher::AudioSettings(bool per_game, Game* game)
     const auto local = get(section, key);
     const int value = local ? std::atoi(local->c_str()) : global;
     const std::string label = std::to_string(value) + std::string(suffix);
-    return per_game && !local ? GlobalValueLabel(label) : label;
+    return label;
   };
   const auto bool_label = [&](std::string_view section, std::string_view key, bool global,
                               std::string_view on, std::string_view off) {
     const auto local = get(section, key);
     const bool value = local ? (*local == "True" || *local == "true" || *local == "1") : global;
-    return per_game && !local ? GlobalValueLabel(value ? on : off) : std::string(value ? on : off);
+    return std::string(value ? on : off);
   };
   const auto edit_integer = [&](std::string_view title, std::string_view section,
                                 std::string_view key, const Config::Info<int>& info,
@@ -9782,27 +9448,21 @@ void Launcher::AudioSettings(bool per_game, Game* game)
       return std::to_string(candidate) + std::string(suffix);
     };
     std::vector<std::string> choices;
-    choices.reserve(values.size() + (per_game ? 1 : 0));
-    if (per_game)
-      choices.push_back(UseGlobalValueLabel(format(global)));
+    choices.reserve(values.size());
     for (const int preset : values)
       choices.push_back(format(preset));
     int selected = static_cast<int>(std::ranges::find(values, value) - values.begin());
-    if (per_game)
-      selected = local ? selected + 1 : 0;
+    const int previous = selected;
     if (delta == 0)
       selected = Dropdown(title, choices, selected, true, false);
     else
       selected = (selected + (delta < 0 ? -1 : 1) + static_cast<int>(choices.size())) %
                  static_cast<int>(choices.size());
+    if (per_game && selected == previous)
+      return;
     if (selected < 0)
       return;
-    if (per_game && selected == 0)
-    {
-      SetGameSetting(*game, section, key, std::nullopt);
-      return;
-    }
-    value = values[per_game ? selected - 1 : selected];
+    value = values[selected];
     if (per_game)
       SetGameSetting(*game, section, key, std::to_string(value));
     else
@@ -9972,7 +9632,7 @@ void Launcher::ConsoleSettings(bool per_game, Game* game)
     const bool automatic = wii ? IsWiiLanguageAuto() : IsGameCubeLanguageAuto();
     const std::string global_label =
         automatic ? (wii ? automatic_wii_label : automatic_gc_label) : std::string(labels[value]);
-    return per_game ? GlobalValueLabel(global_label) : global_label;
+    return global_label;
   };
   const auto bool_label = [&](std::string_view section, std::string_view key, bool global) {
     return per_game ? PerGameBoolLabel(*game, section, key, global) :
@@ -9998,6 +9658,8 @@ void Launcher::ConsoleSettings(bool per_game, Game* game)
           rows.push_back({"Wii system settings", ">", true, false, false});
           rows.push_back({"GameCube Slot A / B", ">", true, false, false});
         }
+        rows.push_back(
+            {"Game Boy Advance link", "BIOS / cartridges / screens", true, false, false});
         return rows;
       },
       [&](int index, int delta) {
@@ -10016,32 +9678,18 @@ void Launcher::ConsoleSettings(bool per_game, Game* game)
           std::vector<std::string> choices;
           choices.reserve(labels.size() + 1);
           const std::string automatic_label = wii ? automatic_wii_label : automatic_gc_label;
-          if (per_game)
-          {
-            const int inherited_value =
-                std::clamp(global_value, 0, static_cast<int>(labels.size()) - 1);
-            const std::string inherited =
-                global_automatic ? automatic_label : std::string(labels[inherited_value]);
-            choices.emplace_back(UseGlobalValueLabel(inherited));
-          }
-          else
-          {
+          if (!per_game)
             choices.emplace_back(automatic_label);
-          }
           for (const std::string_view label : labels)
             choices.emplace_back(label);
 
-          int selected = 0;
-          if (const auto local = get(section, key))
-          {
-            selected =
-                std::clamp(std::atoi(local->c_str()), 0, static_cast<int>(labels.size()) - 1) + 1;
-          }
-          else if (!per_game && !global_automatic)
-          {
-            selected = std::clamp(global_value, 0, static_cast<int>(labels.size()) - 1) + 1;
-          }
+          const auto local = get(section, key);
+          int selected = std::clamp(local ? std::atoi(local->c_str()) : global_value, 0,
+                                    static_cast<int>(labels.size()) - 1);
+          if (!per_game)
+            selected = global_automatic ? 0 : selected + 1;
 
+          const int previous = selected;
           if (delta == 0)
           {
             selected = Dropdown(wii ? "Wii language" : "GameCube language", choices, selected);
@@ -10052,13 +9700,10 @@ void Launcher::ConsoleSettings(bool per_game, Game* game)
             selected = (selected + (delta < 0 ? -1 : 1) + choice_count) % choice_count;
           }
 
+          if (per_game && selected == previous)
+            return false;
           if (per_game)
-          {
-            if (selected == 0)
-              SetGameSetting(*game, section, key, std::nullopt);
-            else
-              SetGameSetting(*game, section, key, std::to_string(selected - 1));
-          }
+            SetGameSetting(*game, section, key, std::to_string(selected));
           else
           {
             if (wii)
@@ -10102,6 +9747,10 @@ void Launcher::ConsoleSettings(bool per_game, Game* game)
         else if (!per_game && index == 6)
         {
           GameCubeDeviceSettings();
+        }
+        else if (index == (per_game ? 5 : 7))
+        {
+          GBASettings();
         }
         if (!per_game)
           MarkConfigDirty();
@@ -10883,7 +10532,7 @@ void Launcher::RenderControllerCapture(const InputBinding& binding, int position
   const int hint_step = FontHeight(m_font_small) + 10;
   const int hint_y =
       m_height - hint_band + (hint_band - hint_step - FontHeight(m_font_small)) / 2;
-  DrawFooterBand(hint_band);
+
   DrawTextCentered(m_font_small, m_width / 2, hint_y,
                    m_localization.Translate("Hold Plus to clear       Hold Minus to cancel"),
                    m_dim);
@@ -11157,7 +10806,7 @@ void Launcher::ControllerMappingSettings(bool wii, int port, bool per_game, Game
       {
         if (event.cbutton.button == BUTTON_CONFIRM)
           assign_selected();
-        else if (event.cbutton.button == BUTTON_SETTINGS)
+        else if (event.cbutton.button == BUTTON_X)
           show_selected_info();
         else if (event.cbutton.button == BUTTON_CANCEL)
         {
@@ -12045,8 +11694,6 @@ void Launcher::ControllerSettings(bool per_game, Game* game)
           std::string device_label =
               std::string(gc_type_name(device)) +
               (device == SerialInterface::SIDEVICE_NONE ? "" : " · P" + std::to_string(player + 1));
-          if (per_game && !local)
-            device_label = GlobalValueLabel(device_label);
           rows.push_back({"GameCube controller " + std::to_string(index + 1),
                           std::move(device_label), true, false, true, true, false});
         }
@@ -12066,8 +11713,6 @@ void Launcher::ControllerSettings(bool per_game, Game* game)
           std::string source_label = source == WiimoteSource::None ?
                                          std::string("Disabled") :
                                          extension + " · P" + std::to_string(player + 1);
-          if (per_game && !local)
-            source_label = GlobalValueLabel(source_label);
           rows.push_back({"Wii Remote " + std::to_string(index + 1), std::move(source_label), true,
                           false, true, true, false});
         }
@@ -12081,8 +11726,6 @@ void Launcher::ControllerSettings(bool per_game, Game* game)
                       (Config::Get(Config::MAIN_SWITCH_TOUCHSCREEN_POINTER) ? "On" : "Off")) :
                  "Wii games only",
              wii_game});
-        rows.push_back(
-            {"Game Boy Advance link", "BIOS / cartridges / screens", true, false, false});
         return rows;
       },
       [&](int index, int delta) {
@@ -12192,8 +11835,6 @@ void Launcher::ControllerSettings(bool per_game, Game* game)
             MarkConfigDirty();
           }
         }
-        else if (index == 9)
-          GBASettings();
         return false;
       },
       false,
@@ -12249,8 +11890,7 @@ void Launcher::GameModsSettings(Game* game)
         const auto local = GetGameSetting(*game, "Core", "EnableCheats");
         const bool cheats = local ? Lower(*local) == "true" || *local == "1" :
                                     Config::Get(Config::MAIN_ENABLE_CHEATS);
-        const std::string cheat_value = cheats ? "Enabled" : "Disabled";
-        const std::string cheat_label = local ? cheat_value : GlobalValueLabel(cheat_value);
+        const std::string cheat_label = cheats ? "Enabled" : "Disabled";
         std::vector<Row> rows{
             {"Download Gecko codes", "GameTDB / RC24", true, false, false},
             {"Launch with Riivolution XML", "Choose patch set", true, false, false},
@@ -14106,10 +13746,8 @@ void Launcher::DrawUpdateNotification()
 
 void Launcher::AppearanceSettings()
 {
-  static constexpr std::array<std::string_view, 5> THEMES = {"XMB (PS3)", "Bubbles", "Glow",
-                                                             "Classic", "OLED black"};
-  static constexpr std::array<std::string_view, 5> THEME_VALUES = {"xmb", "bubbles", "glow",
-                                                                   "classic", "oled"};
+  static constexpr std::array<std::string_view, 2> THEMES = {"Wii", "Classic"};
+  static constexpr std::array<std::string_view, 2> THEME_VALUES = {"wii", "classic"};
   constexpr int option_count = 11;
   constexpr int update_row = option_count;
   constexpr int selection_count = option_count + 1;
@@ -14119,7 +13757,7 @@ void Launcher::AppearanceSettings()
   static int saved_top = 0;
 
   const auto rows_provider = [&] {
-    int theme_index = 1;
+    int theme_index = 0;
     const auto iterator =
         std::ranges::find(THEME_VALUES, std::string_view(m_store.Get("Launcher/Theme")));
     if (iterator != THEME_VALUES.end())
@@ -14145,7 +13783,7 @@ void Launcher::AppearanceSettings()
   const auto apply_option = [&](int index, int delta) {
     if (index == 0)
     {
-      int current = 1;
+      int current = 0;
       const auto iterator =
           std::ranges::find(THEME_VALUES, std::string_view(m_store.Get("Launcher/Theme")));
       if (iterator != THEME_VALUES.end())
@@ -14247,7 +13885,7 @@ void Launcher::AppearanceSettings()
     switch (index)
     {
     case 0:
-      m_store.Set("Launcher/Theme", "bubbles");
+      m_store.Set("Launcher/Theme", "wii");
       break;
     case 1:
       m_store.Set("Launcher/Language", "system");
@@ -14379,7 +14017,7 @@ void Launcher::AppearanceSettings()
       {
         apply_option(selection, 1);
       }
-      else if ((button == BUTTON_SETTINGS || key == SDLK_x) && selection < option_count)
+      else if ((button == BUTTON_X || key == SDLK_x) && selection < option_count)
       {
         const SettingHelpInfo info = SettingHelpFor("Launcher", rows[selection]);
         const std::string_view current = rows[selection].value == ">" ?
@@ -14475,9 +14113,7 @@ void Launcher::AppearanceSettings()
     int hint_count = 0;
     if (selection < option_count && rows[selection].adjustable)
     {
-      // The empty label is the deliberate glyph pair: Left and Right share one caption.
-      footer[hint_count++] = {"Left", ""};
-      footer[hint_count++] = {"Right", "Change"};
+      footer[hint_count++] = {"Left / Right", "Change"};
     }
     footer[hint_count++] = {"A", "Choose"};
     if (selection < option_count)
@@ -15543,7 +15179,7 @@ bool Launcher::RenderTransfer(TransferState* state)
   if (state->cancelled.load(std::memory_order_relaxed))
   {
     // Same band and baseline as DrawFooter, so the text doesn't jump.
-    DrawFooterBand(FontHeight(m_font_small) + 32);
+
     DrawTextCentered(m_font_small, m_width / 2, m_height - 26 - FontHeight(m_font_small) / 2,
                      m_localization.Translate("Cancelling..."), m_value);
   }
@@ -15598,9 +15234,9 @@ void Launcher::RunBusyTask(std::string_view title, std::string_view detail,
         }
       }
       ClearBackground();
-      DrawHeader(owned_title, owned_detail);
+      DrawHeader(owned_title);
       const int panel_width = std::min(920, m_width - 180);
-      const int panel_height = 196;
+      const int panel_height = 250;
       const int panel_x = (m_width - panel_width) / 2;
       const int panel_y = (m_height - panel_height) / 2;
       GlassPanel(panel_x, panel_y, panel_width, panel_height);
@@ -15614,10 +15250,12 @@ void Launcher::RunBusyTask(std::string_view title, std::string_view detail,
         const int phase = static_cast<int>((SDL_GetTicks() / 220) % 4);
         std::string message(m_localization.Translate("Working"));
         message.append(static_cast<std::size_t>(phase), '.');
-        DrawTextCentered(m_font_large, m_width / 2, panel_y + 44, message, m_value);
+        DrawTextCentered(m_font_large, m_width / 2, panel_y + 32, message, m_value);
       }
-      DrawTextCentered(
-          m_font_small, m_width / 2, panel_y + 112,
+      DrawTextCentered(m_font_small, m_width / 2, panel_y + 92,
+                       Ellipsize(m_font_small, owned_detail, panel_width - 108), m_dim);
+      DrawWrappedCentered(
+          m_font_small, m_width / 2, panel_y + 136, panel_width - 108, 32, 2,
           m_localization.Translate(cancel && cancel->load(std::memory_order_acquire) ?
                                        "Cancelling at the next safe point..." :
                                        "Do not remove the active storage device or close Dolphin."),
@@ -15626,10 +15264,10 @@ void Launcher::RunBusyTask(std::string_view title, std::string_view detail,
       {
         const std::array<std::pair<std::string_view, std::string_view>, 1> hints = {
             std::pair{"B", "Cancel"}};
-        DrawFooter(hints);
+        DrawFooter(hints, panel_y + panel_height - 28);
       }
       SDL_RenderPresent(m_renderer);
-      WaitForNextFrame();
+      WaitForNextFrame(true);
     }
     else
     {
@@ -15857,36 +15495,6 @@ void Launcher::FileActions(const std::string& path)
     RenamePath(path);
 }
 
-std::string Launcher::GameLocationLabel(const Game& game) const
-{
-  if (game.installed_nand)
-  {
-    char location[40];
-    std::snprintf(location, sizeof(location), "Wii NAND: %016llx",
-                  static_cast<unsigned long long>(game.title_id));
-    return location;
-  }
-  const std::string path = NormalizePath(game.path);
-  for (const Storage::SmbShare& share : m_shares)
-  {
-    const std::string root = NormalizePath(Storage::SmbRootPath(share.id));
-    if (root.empty() || !PathAtOrBelow(path, root))
-      continue;
-    std::string relative = path.substr(std::min(path.size(), root.size()));
-    while (!relative.empty() && relative.front() == '/')
-      relative.erase(relative.begin());
-    std::string address = "SMB: smb://" + share.server + "/" + share.share;
-    if (!relative.empty())
-      address += "/" + relative;
-    return address;
-  }
-  if (path.starts_with("sdmc:"))
-    return "SD: " + path;
-  if (Lower(path).starts_with("ums"))
-    return "USB: " + path;
-  return path;
-}
-
 std::string Launcher::FileBrowser(const std::string& start, bool select_folder, bool select_game,
                                   bool manage, std::span<const std::string_view> extensions,
                                   std::string_view selection_title)
@@ -16100,7 +15708,7 @@ std::string Launcher::FileBrowser(const std::string& start, bool select_folder, 
                                 event.cbutton.button == BUTTON_CANCEL :
                                 event.key.keysym.sym == SDLK_ESCAPE;
         const bool options =
-            event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == BUTTON_SETTINGS;
+            event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == BUTTON_X;
         const bool paste = event.type == SDL_CONTROLLERBUTTONDOWN &&
                            event.cbutton.button == SDL_CONTROLLER_BUTTON_X;
         const bool eject = event.type == SDL_CONTROLLERBUTTONDOWN ?
@@ -16295,300 +15903,142 @@ void Launcher::FileManager()
   FileBrowser({}, false, false, true);
 }
 
-void Launcher::LibraryFilterMenu()
-{
-  std::vector<std::string> choices;
-  choices.emplace_back(m_localization.Translate("All games"));
-  choices.emplace_back(m_localization.Translate("Favorites"));
-  for (const Collection& collection : m_collections)
-    choices.push_back(collection.name);
-  const int manage_index = static_cast<int>(choices.size());
-  choices.emplace_back(m_localization.Translate("Manage collections..."));
-  const int search_index = static_cast<int>(choices.size());
-  choices.emplace_back(m_localization.Translate("Search..."));
-  const int clear_search_index = static_cast<int>(choices.size());
-  if (!m_search_query.empty())
-    choices.emplace_back(m_localization.Translate("Clear search"));
-
-  int current = 0;
-  if (m_active_collection == "favorites")
-    current = 1;
-  else if (!m_active_collection.empty())
-  {
-    const auto found = std::ranges::find(m_collections, m_active_collection, &Collection::name);
-    if (found != m_collections.end())
-      current = 2 + static_cast<int>(found - m_collections.begin());
-  }
-  const int selected = Dropdown("Library view", choices, current, true, false);
-  if (selected < 0)
-    return;
-  if (selected == 0)
-    m_active_collection.clear();
-  else if (selected == 1)
-    m_active_collection = "favorites";
-  else if (selected >= 2 && selected < manage_index)
-    m_active_collection = m_collections[selected - 2].name;
-  else if (selected == manage_index)
-  {
-    ManageCollections();
-  }
-  else if (selected == search_index)
-  {
-    std::string query;
-    if (PromptText("Search games", m_search_query, &query, false, true,
-                   "Search title, Game ID, platform, or path"))
-      m_search_query = Trim(std::move(query));
-  }
-  else if (selected == clear_search_index)
-  {
-    m_search_query.clear();
-  }
-  RebuildVisibleGames();
-}
-
-void Launcher::ManageCollections()
-{
-  const auto normalize_name = [&](std::string name, std::string_view previous = {}) {
-    name = Trim(std::move(name));
-    if (name.size() > 64)
-      name.resize(64);
-    const bool invalid = name.empty() || Lower(name) == "favorites" ||
-                         std::ranges::any_of(name, [](unsigned char character) {
-                           return character < ' ' || character == ',' || character == '=';
-                         });
-    const bool duplicate = std::ranges::any_of(m_collections, [&](const Collection& collection) {
-      return collection.name != previous && Lower(collection.name) == Lower(name);
-    });
-    return invalid || duplicate ? std::string{} : name;
-  };
-
-  RunRows(
-      "Manage collections", {},
-      [&] {
-        std::vector<Row> rows{{"Create collection...", ">", true, false, false}};
-        rows.reserve(m_collections.size() + 1);
-        for (const Collection& collection : m_collections)
-        {
-          rows.push_back({collection.name,
-                          std::to_string(collection.members.size()) +
-                              (collection.members.size() == 1 ? " game" : " games"),
-                          true, false, false, false, false});
-        }
-        return rows;
-      },
-      [&](int index, int) {
-        if (index == 0)
-        {
-          std::string entered;
-          if (!PromptText("Collection name", {}, &entered, false, false))
-            return false;
-          entered = normalize_name(std::move(entered));
-          if (entered.empty())
-          {
-            Toast("Invalid or duplicate collection name", 1000);
-            return false;
-          }
-          m_collections.push_back({std::move(entered), {}});
-          SaveCollections();
-          return false;
-        }
-
-        const std::size_t collection_index = static_cast<std::size_t>(index - 1);
-        if (collection_index >= m_collections.size())
-          return false;
-        Collection& collection = m_collections[collection_index];
-        const int choice =
-            Dropdown(collection.name, {"View collection", "Rename", "Delete"}, -1, false, true);
-        if (choice == 0)
-        {
-          m_active_collection = collection.name;
-          return true;
-        }
-        if (choice == 1)
-        {
-          const std::string old_name = collection.name;
-          std::string entered;
-          if (!PromptText("Rename collection", old_name, &entered, false, false))
-            return false;
-          entered = normalize_name(std::move(entered), old_name);
-          if (entered.empty())
-          {
-            Toast("Invalid or duplicate collection name", 1000);
-            return false;
-          }
-          collection.name = entered;
-          if (m_active_collection == old_name)
-            m_active_collection = entered;
-          SaveCollections();
-          return false;
-        }
-        if (choice == 2 &&
-            Confirm("Delete collection?",
-                    std::array<std::string, 2>{collection.name,
-                                               "Games and save data will not be deleted."}))
-        {
-          if (m_active_collection == collection.name)
-            m_active_collection.clear();
-          m_collections.erase(m_collections.begin() + collection_index);
-          SaveCollections();
-        }
-        return false;
-      },
-      true);
-  RebuildVisibleGames();
-}
-
-void Launcher::EditGameOrganization(Game* game)
-{
-  if (!game)
-    return;
-  RunRows(
-      "Favorites & collections", game->title,
-      [&] {
-        std::vector<Row> rows;
-        rows.push_back({"Favorite", m_favorites.contains(game->key) ? "Yes" : "No"});
-        rows.push_back({"Create collection...", ">", true, false, false});
-        for (const Collection& collection : m_collections)
-        {
-          rows.push_back({collection.name,
-                          collection.members.contains(game->key) ?
-                              std::string(m_localization.Translate("Added")) :
-                              std::string(m_localization.Translate("Not added")),
-                          true, false, true, false});
-        }
-        return rows;
-      },
-      [&](int index, int) {
-        if (index == 0)
-        {
-          if (!m_favorites.erase(game->key))
-            m_favorites.insert(game->key);
-        }
-        else if (index == 1)
-        {
-          std::string name;
-          if (!PromptText("Collection name", {}, &name, false, false))
-            return false;
-          name = Trim(std::move(name));
-          if (name.size() > 64)
-            name.resize(64);
-          if (name.empty() || name == "favorites" ||
-              std::ranges::any_of(name, [](unsigned char character) {
-                return character < ' ' || character == ',' || character == '=';
-              }))
-          {
-            Toast("Invalid collection name", 1000);
-            return false;
-          }
-          const auto existing = std::ranges::find(m_collections, name, &Collection::name);
-          if (existing == m_collections.end())
-          {
-            Collection collection;
-            collection.name = name;
-            collection.members.insert(game->key);
-            m_collections.emplace_back(std::move(collection));
-          }
-          else
-          {
-            existing->members.insert(game->key);
-          }
-        }
-        else
-        {
-          Collection& collection = m_collections[index - 2];
-          if (!collection.members.erase(game->key))
-            collection.members.insert(game->key);
-        }
-        SaveCollections();
-        RebuildVisibleGames();
-        return false;
-      },
-      true);
-}
-
 void Launcher::DownloadCovers()
 {
-  const std::string api_key = Trim(m_store.Get("Network/SteamGridDBKey"));
-  if (!m_cover_download_ready || api_key.empty())
+  if (!m_cover_download_ready)
   {
-    RenderMessage("Cover download unavailable",
-                  std::array<std::string, 2>{"A SteamGridDB API key is required.",
-                                             "Configure it in Settings > Launcher."},
+    RenderMessage("Cover downloads unavailable",
+                  std::array<std::string, 1>{"Check the Switch network connection and try again."},
                   true);
     return;
   }
-  struct MissingCover
+  std::string api_key = Trim(m_store.Get("Network/SteamGridDBKey"));
+  if (api_key.empty())
+  {
+    if (!PromptText("Enter your free SteamGridDB API key", {}, &api_key, true, false,
+                    "Create a free API key at steamgriddb.com/profile/preferences/api"))
+      return;
+    api_key = Trim(std::move(api_key));
+    if (api_key.empty())
+      return;
+    m_store.Set("Network/SteamGridDBKey", api_key);
+    MarkStoreDirty();
+    FlushPendingSaves();
+  }
+  struct ArtworkJob
+  {
+    std::string key, title, cover, background;
+    long id = 0;
+  };
+  struct ArtworkResult
   {
     std::string key;
-    std::string title;
-    std::string path;
+    long id = 0;
+    bool cover = false, background = false, background_missing = false;
   };
-  std::vector<MissingCover> missing;
+  std::vector<ArtworkJob> pending;
   for (const Game& game : m_games)
   {
-    const std::string path = CoverPath(game);
-    if (!RegularFileExists(path))
-      missing.push_back({game.key, game.title, path});
+    const bool cover = !RegularFileExists(CoverPath(game));
+    const bool background = !RegularFileExists(BackgroundPath(game)) &&
+                            !m_store.GetBool(ArtworkKey(game, "BackgroundMissing"), false);
+    if (cover || background)
+      pending.push_back({game.key, game.title, cover ? CoverPath(game) : std::string{},
+                         background ? BackgroundPath(game) : std::string{},
+                         m_store.GetInt(ArtworkKey(game, "GameId"), 0)});
   }
-  if (missing.empty())
+  if (pending.empty())
   {
-    Toast("Every game already has a cover", 1000);
+    Toast("All artwork already downloaded", 1000);
     return;
   }
-  if (!Confirm("Download covers?",
-               std::array<std::string, 2>{std::to_string(missing.size()) + " " +
-                                              std::string(m_localization.Translate("games")),
-                                          std::string(m_localization.Translate(
-                                              "Press B while downloading to cancel safely."))}))
-    return;
-
   std::atomic_bool cancel{false};
-  std::atomic<int> downloaded{0};
-  std::atomic<int> failed{0};
-  std::vector<std::string> downloaded_keys;
-  downloaded_keys.reserve(missing.size());
-  const auto task = [&] {
-    CoverDownload::RequestOptions options;
-    options.cancel = &cancel;
-    for (const MissingCover& item : missing)
+  int updated = 0, failed_count = 0;
+  std::vector<ArtworkResult> saved_results;
+  RunBusyTask(
+      "Downloading artwork",
+      std::to_string(pending.size()) + " " + std::string(m_localization.Translate("games queued")),
+      [&] {
+        CoverDownload::RequestOptions options{&cancel};
+        for (const ArtworkJob& job : pending)
+        {
+          if (cancel.load(std::memory_order_acquire))
+            break;
+          ArtworkResult saved{job.key, job.id};
+          CoverDownload::Result result = CoverDownload::Result::Ok;
+          if (saved.id <= 0 && !job.cover.empty())
+          {
+            CoverDownload::CoverSelection selection;
+            result = CoverDownload::DownloadBestCover(api_key, job.title, job.cover, &selection,
+                                                      &options);
+            if (result == CoverDownload::Result::Ok)
+            {
+              saved.id = selection.game_id;
+              saved.cover = true;
+            }
+          }
+          else if (saved.id <= 0)
+          {
+            std::vector<CoverDownload::GameResult> matches;
+            result = CoverDownload::SearchGames(api_key, job.title, &matches, &options);
+            if (result == CoverDownload::Result::Ok)
+              saved.id = matches.front().id;
+          }
+          if (result != CoverDownload::Result::Ok)
+          {
+            if (result != CoverDownload::Result::Cancelled)
+              ++failed_count;
+            continue;
+          }
+          bool failed = false;
+          if (!job.cover.empty() && !saved.cover)
+          {
+            std::vector<CoverDownload::Artwork> artworks;
+            result = CoverDownload::FetchArtwork(api_key, saved.id, &artworks, &options);
+            if (result == CoverDownload::Result::Ok)
+              result = CoverDownload::DownloadImage(artworks.front().url, job.cover, &options);
+            saved.cover = result == CoverDownload::Result::Ok;
+            failed =
+                result != CoverDownload::Result::Ok && result != CoverDownload::Result::Cancelled;
+          }
+          if (!job.background.empty() && !cancel.load(std::memory_order_acquire))
+          {
+            std::vector<CoverDownload::Artwork> artworks;
+            result = CoverDownload::FetchBackgrounds(api_key, saved.id, &artworks, &options);
+            if (result == CoverDownload::Result::Ok)
+              result = CoverDownload::DownloadImage(artworks.front().url, job.background, &options);
+            saved.background = result == CoverDownload::Result::Ok;
+            saved.background_missing = result == CoverDownload::Result::NotFound;
+            failed |= result != CoverDownload::Result::Ok &&
+                      result != CoverDownload::Result::NotFound &&
+                      result != CoverDownload::Result::Cancelled;
+          }
+          if (saved.cover || saved.background)
+            ++updated;
+          if (failed)
+            ++failed_count;
+          saved_results.emplace_back(std::move(saved));
+        }
+      },
+      &cancel);
+  for (const ArtworkResult& saved : saved_results)
+    if (Game* game = FindGameByKey(saved.key))
     {
-      if (cancel.load(std::memory_order_acquire))
-        break;
-      const CoverDownload::Result result =
-          CoverDownload::DownloadBestCover(api_key, item.title, item.path, nullptr, &options);
-      if (result == CoverDownload::Result::Ok)
-      {
-        downloaded.fetch_add(1, std::memory_order_relaxed);
-        downloaded_keys.emplace_back(item.key);
-      }
-      else if (result != CoverDownload::Result::Cancelled)
-        failed.fetch_add(1, std::memory_order_relaxed);
+      m_store.Set(ArtworkKey(*game, "GameId"), std::to_string(saved.id));
+      if (saved.background || saved.background_missing)
+        m_store.SetBool(ArtworkKey(*game, "BackgroundMissing"), saved.background_missing);
+      if (saved.cover)
+        ReloadCover(game);
+      if (saved.background)
+        ReloadBackground(game);
     }
-  };
-  RunBusyTask("Downloading covers", std::to_string(missing.size()) + " games queued", task,
-              &cancel);
-  const std::unordered_set<std::string> downloaded_set(downloaded_keys.begin(),
-                                                       downloaded_keys.end());
-  for (Game& game : m_games)
-  {
-    if (!downloaded_set.contains(game.key))
-      continue;
-    if (game.cover)
-      SDL_DestroyTexture(game.cover);
-    game.cover = nullptr;
-    game.cover_use = 0;
-    game.cover_loaded_at = 0;
-    game.cover_attempted = false;
-  }
-  if (cancel.load(std::memory_order_acquire))
-    Toast("Cover download cancelled", 1000);
-  else
-    RenderMessage("Cover download complete",
-                  std::array<std::string, 2>{
-                      std::to_string(downloaded.load()) + " " +
-                          std::string(m_localization.Translate("downloaded")),
-                      std::to_string(failed.load()) + " " +
-                          std::string(m_localization.Translate("not found or failed"))});
+  MarkStoreDirty();
+  FlushPendingSaves();
+  char message[160];
+  std::snprintf(message, sizeof(message),
+                m_localization.Translate("Artwork: %d updated, %d failed%s").data(), updated,
+                failed_count, cancel.load() ? m_localization.Translate(" (cancelled)").data() : "");
+  Toast(message, 1800);
 }
 
 bool Launcher::EjectUsbLocation(std::string_view stable_id)
@@ -16626,7 +16076,7 @@ void Launcher::LibrarySettings()
 {
   constexpr int row_count = 7;
   const int row_height = SettingsRowHeight();
-  const int start_y = SettingsListY();
+  const int start_y = SettingsListY() + 40;
   auto& saved = m_row_positions["Library & storage\n"];
   int selection = std::clamp(saved.first, 0, row_count - 1);
   std::size_t installed_count = Tools::ListInstalledWiiTitles().size();
@@ -16688,6 +16138,16 @@ void Launcher::LibrarySettings()
         if (m_pending_launch)
           return;
       }
+      else if (selection == 3 &&
+               ((event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == BUTTON_X) ||
+                (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_x)))
+      {
+        ShowInfoCard("Library & storage", "Download covers", "Library artwork",
+                     "Downloads missing covers and Classic backgrounds from SteamGridDB. Existing "
+                     "local artwork is kept.",
+                     {}, "Launcher action");
+        BeginScreenFx();
+      }
       else if ((event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == BUTTON_CANCEL) ||
                (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE))
       {
@@ -16702,6 +16162,7 @@ void Launcher::LibrarySettings()
     const int column_x = (m_width - column_width) / 2;
     const int label_x = column_x + 40;
     const int value_x = column_x + column_width - 40;
+    DrawSectionHeading("General", column_x, start_y - 44, column_width);
     GlassPanel(column_x - 12, start_y - 10, column_width + 24, row_count * row_height + 18);
     const float target = static_cast<float>(start_y + selection * row_height + 2);
     m_highlight_y = (!m_animations || m_highlight_y < 0.0f) ?
@@ -16740,7 +16201,10 @@ void Launcher::LibrarySettings()
                           current ? m_value : m_text, current ? m_value : m_dim, false,
                           row_height);
     }
-    DrawSettingsFooter("A  Open       B  Back");
+    if (selection == 3)
+      DrawSettingsFooter("A  Select       X  Info       B  Back");
+    else
+      DrawSettingsFooter("A  Open       B  Back");
     DrawFadeIn();
     SDL_RenderPresent(m_renderer);
     WaitForNextFrame();
@@ -16749,11 +16213,19 @@ void Launcher::LibrarySettings()
 }
 
 int Launcher::ChooseCoverArtwork(const std::vector<CoverDownload::Artwork>& artwork,
-                                 std::string_view game_name)
+                                 std::string_view game_name, bool background)
 {
   if (artwork.empty())
     return -1;
-  const GameDetailLayout layout = ComputeGameDetailLayout();
+  GameDetailLayout layout = ComputeGameDetailLayout();
+  if (background)
+  {
+    const int top_y = TopBarHeight() + 24;
+    const int bottom = m_height - SettingsFooterReserve() - 12;
+    constexpr int width = 680, height = width * 9 / 16;
+    layout = {{40, top_y + (bottom - top_y - height) / 2, width, height},
+              {768, top_y, m_width - 824, bottom - top_y}};
+  }
   const int list_x = layout.content.x;
   const int list_width = layout.content.w;
   const int row_height = SettingsRowHeight() + 8;
@@ -16778,7 +16250,7 @@ int Launcher::ChooseCoverArtwork(const std::vector<CoverDownload::Artwork>& artw
     loaded = index;
     preview_failed = false;
     ClearBackground();
-    DrawHeader("Choose cover artwork", game_name);
+    DrawHeader(background ? "Choose background artwork" : "Choose cover artwork", game_name);
     DrawArtworkPreview(nullptr, layout.preview, false, std::string_view{});
     DrawTextCentered(m_font, layout.preview.x + layout.preview.w / 2, m_height / 2 - 18,
                      m_localization.Translate("Loading preview..."), m_dim);
@@ -16789,10 +16261,10 @@ int Launcher::ChooseCoverArtwork(const std::vector<CoverDownload::Artwork>& artw
     CoverDownload::Result result = CoverDownload::Result::Error;
     CoverDownload::RequestOptions options{&cancel};
     RunBusyTask(
-        "Loading cover preview", std::string(game_name),
+        "Loading preview...", std::string(game_name),
         [&] { result = CoverDownload::DownloadImage(url, temporary, &options); }, &cancel);
     if (result == CoverDownload::Result::Ok)
-      preview = LoadScaledTexture(temporary, preview_width, preview_height);
+      preview = LoadScaledTexture(temporary, preview_width, preview_height, true);
     preview_failed = preview == nullptr;
     std::remove(temporary.c_str());
     BeginScreenFx();
@@ -16863,7 +16335,7 @@ int Launcher::ChooseCoverArtwork(const std::vector<CoverDownload::Artwork>& artw
     }
 
     ClearBackground();
-    DrawHeader("Choose cover artwork", game_name);
+    DrawHeader(background ? "Choose background artwork" : "Choose cover artwork", game_name);
     DrawSectionHeading("Online artwork", list_x, start_y - 44, list_width);
     GlassPanel(list_x - 8, start_y - 8, list_width + 16,
                std::min(visible, static_cast<int>(artwork.size())) * row_height + 16);
@@ -16895,12 +16367,13 @@ int Launcher::ChooseCoverArtwork(const std::vector<CoverDownload::Artwork>& artw
     if (show_failure)
     {
       const SDL_Rect& rectangle = layout.preview;
-      DrawWrapped(m_font_small, rectangle.x + 16, rectangle.y + rectangle.h / 2 - 30,
-                  rectangle.w - 32, FontHeight(m_font_small) + 6, 3,
-                  m_localization.Translate("Preview unavailable"), m_dim);
+      DrawWrappedCentered(m_font_small, rectangle.x + rectangle.w / 2,
+                          rectangle.y + rectangle.h / 2 - 30, rectangle.w - 32,
+                          FontHeight(m_font_small) + 6, 3,
+                          m_localization.Translate("Preview unavailable"), m_dim);
     }
-    static constexpr std::array<std::pair<std::string_view, std::string_view>, 2> footer = {
-        std::pair{"A", "Use artwork"}, std::pair{"B", "Back"}};
+    const std::array<std::pair<std::string_view, std::string_view>, 2> footer = {
+        std::pair{"A", "Use artwork"}, std::pair{"B", background ? "Skip background" : "Back"}};
     DrawFooter(footer);
     DrawFadeIn();
     SDL_RenderPresent(m_renderer);
@@ -17026,16 +16499,62 @@ void Launcher::DownloadCover(Game* game)
       &download_cancel);
   if (download == CoverDownload::Result::Cancelled)
     return;
-  if (download == CoverDownload::Result::Ok)
-  {
-    ReloadCover(game);
-    Toast("Cover downloaded", 1200);
-  }
-  else
+  if (download != CoverDownload::Result::Ok)
   {
     RenderMessage("Cover download failed",
                   std::array<std::string, 1>{CoverDownload::ResultMessage(download)});
+    return;
   }
+  ReloadCover(game);
+  m_store.Set(ArtworkKey(*game, "GameId"), std::to_string(selected_game.id));
+  m_store.SetBool(ArtworkKey(*game, "BackgroundMissing"), false);
+  MarkStoreDirty();
+  std::vector<CoverDownload::Artwork> backgrounds;
+  std::atomic_bool background_cancel{false};
+  CoverDownload::RequestOptions background_options{&background_cancel};
+  CoverDownload::Result background_result = CoverDownload::Result::Error;
+  RunBusyTask(
+      "Loading background artwork", selected_game.name,
+      [&] {
+        background_result = CoverDownload::FetchBackgrounds(api_key, selected_game.id, &backgrounds,
+                                                            &background_options);
+      },
+      &background_cancel);
+  if (background_result == CoverDownload::Result::Cancelled)
+    return;
+  if (background_result == CoverDownload::Result::NotFound)
+  {
+    m_store.SetBool(ArtworkKey(*game, "BackgroundMissing"), true);
+    MarkStoreDirty();
+    Toast("Cover downloaded. No background artwork was found.", 1800);
+    return;
+  }
+  if (background_result != CoverDownload::Result::Ok)
+  {
+    RenderMessage("Background search failed",
+                  std::array<std::string, 1>{CoverDownload::ResultMessage(background_result)});
+    return;
+  }
+  const int background_index = ChooseCoverArtwork(backgrounds, selected_game.name, true);
+  if (background_index < 0 || background_index >= static_cast<int>(backgrounds.size()))
+    return;
+  RunBusyTask(
+      "Downloading selected background", selected_game.name,
+      [&] {
+        background_result = CoverDownload::DownloadImage(
+            backgrounds[background_index].url, BackgroundPath(*game), &background_options);
+      },
+      &background_cancel);
+  if (background_result == CoverDownload::Result::Cancelled)
+    return;
+  if (background_result == CoverDownload::Result::Ok)
+  {
+    ReloadBackground(game);
+    Toast("Cover and background downloaded", 1200);
+  }
+  else
+    RenderMessage("Background download failed",
+                  std::array<std::string, 1>{CoverDownload::ResultMessage(background_result)});
 }
 
 void Launcher::ImportCoverFromFile(Game* game)
@@ -17309,7 +16828,7 @@ void Launcher::CoverSettings(Game* game)
           selection = 1 - selection;
         else if (event.cbutton.button == BUTTON_CONFIRM)
           choose = true;
-        else if (event.cbutton.button == BUTTON_SETTINGS)
+        else if (event.cbutton.button == BUTTON_X)
           info = true;
         else if (event.cbutton.button == SDL_CONTROLLER_BUTTON_X && has_custom_cover)
           remove = true;
@@ -17441,7 +16960,7 @@ void Launcher::SettingsRoot()
       bool activate = false;
       if (event.type == SDL_CONTROLLERBUTTONDOWN)
       {
-        if (event.cbutton.button == BUTTON_SETTINGS)
+        if (event.cbutton.button == BUTTON_X)
         {
           const Row row{std::string(labels[selection]), ">", true, false, false};
           const SettingHelpInfo info = SettingHelpFor("Settings", row);
@@ -17549,12 +17068,8 @@ void Launcher::SettingsRoot()
       std::string value;
       if (index == launcher_row)
       {
-        const std::string theme = Lower(m_store.Get("Launcher/Theme", "bubbles"));
-        value = theme == "xmb"     ? "XMB (PS3)" :
-                theme == "glow"    ? "Glow" :
-                theme == "classic" ? "Classic" :
-                theme == "oled"    ? "OLED black" :
-                                     "Bubbles";
+        const std::string theme = Lower(m_store.Get("Launcher/Theme", "wii"));
+        value = theme == "classic" ? "Classic" : "Wii";
       }
       else if (index == library_row)
         value = "game folders / saves / WAD / networking";
@@ -17616,7 +17131,7 @@ void Launcher::PerGameSettingsRoot(Game* game)
       bool activate = false;
       if (event.type == SDL_CONTROLLERBUTTONDOWN)
       {
-        if (event.cbutton.button == BUTTON_SETTINGS)
+        if (event.cbutton.button == BUTTON_X)
         {
           const Row row{std::string(labels[selection]), ">", true, false, false};
           const SettingHelpInfo info = SettingHelpFor("Game settings", row);
@@ -17744,18 +17259,19 @@ void Launcher::DrawGameMenu(Game* game, int selection)
   for (int index = 0; index < GAME_MENU_COUNT; ++index)
   {
     const bool current = index == selection;
-    const bool submenu = index == 1 || index == 3 || index == 4 || index == 5 || index == 6;
+    const bool submenu = index == 1 || index == 4 || index == 5 || index == 6;
     std::string_view label = GAME_MENU_ITEMS[index];
-    if (index == 3 && m_favorites.contains(game->key))
-      label = "Favorite / collections  ★";
-    else if (index == GAME_MENU_COUNT - 1 && game->installed_nand)
+    if (index == GAME_MENU_COUNT - 1 && game->installed_nand)
       label = "Uninstall WAD (keep save)";
     const SDL_Color color = index == GAME_MENU_COUNT - 1 ? SDL_Color{238, 135, 135, 255} :
                             current                      ? m_value :
                                                            m_text;
-    DrawSettingsRowText(m_localization.Translate(label), submenu ? ">" : "", layout.RowY(index),
-                        menu.w, menu.x + 24, menu.x + menu.w - 24, current, color,
-                        current ? m_value : m_dim, false, layout.row_height);
+    DrawSettingsRowText(
+        m_localization.Translate(label),
+        index == 3 ? m_localization.Translate(m_favorites.contains(game->key) ? "Yes" : "No") :
+                     std::string_view(submenu ? ">" : ""),
+        layout.RowY(index), menu.w, menu.x + 24, menu.x + menu.w - 24, current, color,
+        current ? m_value : m_dim, false, layout.row_height);
   }
   const std::array<std::pair<std::string_view, std::string_view>, 2> footer = {
       std::pair<std::string_view, std::string_view>{"A",
@@ -17840,7 +17356,6 @@ void Launcher::PerGameMenu(Game* game, bool* launch, bool* rescan)
         if (PromptText("Rename game", game->title, &title, false, false))
         {
           game->title = title;
-          game->has_custom_title = true;
           if (!game->installed_nand)
             game->config_override_path = EntryGameIniPath(*game);
           m_store.Set("Alias/" + game->key, title);
@@ -17850,7 +17365,9 @@ void Launcher::PerGameMenu(Game* game, bool* launch, bool* rescan)
       }
       else if (selection == 3)
       {
-        EditGameOrganization(game);
+        if (!m_favorites.erase(game->key))
+          m_favorites.insert(game->key);
+        SaveFavorites();
       }
       else if (selection == 4)
       {
@@ -17965,6 +17482,10 @@ void Launcher::PerGameMenu(Game* game, bool* launch, bool* rescan)
             if (std::remove(game->path.c_str()) == 0)
             {
               std::remove(CoverPath(*game).c_str());
+              std::remove(BackgroundPath(*game).c_str());
+              m_store.RemovePrefix("Artwork/" + game->key + "/");
+              m_favorites.erase(game->key);
+              SaveFavorites();
               std::remove(GameIniPath(*game).c_str());
               *rescan = true;
               Toast("Game deleted", 800);
@@ -18218,6 +17739,46 @@ std::optional<LaunchRequest> Launcher::Run()
     selection = 0;
   };
 
+  const auto change_tab = [&](int tab) {
+    SelectLibraryTab(tab, &selection);
+    pin_first_library_page = false;
+    desired_selection_key.clear();
+  };
+  const auto open_settings = [&] {
+    const std::vector<std::string> old_sources = m_sources;
+    const Game* selected = VisibleGame(selection);
+    const std::string selected_key = selected ? selected->key : std::string{};
+    SettingsRoot();
+    FlushPendingSaves();
+    if (!m_pending_launch && (old_sources != m_sources || m_library_refresh_requested))
+      rescan_library();
+    else
+      selection = VisibleIndexForKey(selected_key);
+    m_recent_position = -1;
+    BeginScreenFx();
+  };
+  const auto activate_header = [&](int item) {
+    if (item == 3)
+      open_settings();
+    else
+    {
+      change_tab(item);
+      m_library_header_focused = false;
+    }
+  };
+  const auto activate_empty = [&] {
+    if (m_library_view == LibraryView::All)
+      open_settings();
+    else
+      change_tab(static_cast<int>(LibraryView::All));
+    m_library_header_focused = false;
+  };
+  const auto page_library = [&](int direction) {
+    selection = GridPage(selection, direction);
+    m_library_header_focused = false;
+    pin_first_library_page = false;
+  };
+
   while (BeginFrame() && !launch && !m_pending_launch)
   {
     if (m_library_scan)
@@ -18306,8 +17867,7 @@ std::optional<LaunchRequest> Launcher::Run()
           const std::string id = game.storage_id.substr(4);
           if (!removed_ids.contains(id) && !changed_ids.contains(id))
             return false;
-          if (game.cover)
-            SDL_DestroyTexture(game.cover);
+          ReleaseGameArtwork(game);
           return true;
         });
         // A removed volume may have produced a WAD candidate which is still in the worker's ready
@@ -18332,30 +17892,68 @@ std::optional<LaunchRequest> Launcher::Run()
     }
 
     SDL_Event event{};
-    while (PollEvent(&event))
+    while (!launch && !m_pending_launch && m_running && PollEvent(&event))
     {
-      int touch_x = 0;
-      int touch_y = 0;
+      if (event.type == SDL_CONTROLLERAXISMOTION &&
+          (event.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT ||
+           event.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT))
+      {
+        const std::size_t trigger = event.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT ? 0 : 1;
+        const bool pressed = event.caxis.value > 18000;
+        if (pressed && !m_library_triggers[trigger])
+          page_library(trigger ? 1 : -1);
+        m_library_triggers[trigger] = pressed;
+        continue;
+      }
+      int touch_x = 0, touch_y = 0;
       const TouchKind touch = FeedTouch(event, &touch_x, &touch_y);
+      const int count = static_cast<int>(m_visible_games.size());
+      selection = count ? std::clamp(selection, 0, count - 1) : 0;
       if (touch == TouchKind::SwipeLeft || touch == TouchKind::SwipeRight)
       {
+        const int direction = touch == TouchKind::SwipeLeft ? 1 : -1;
+        if (m_touch.start_y < 88)
+          change_tab((static_cast<int>(m_library_view) + direction + 3) % 3);
+        else
+          page_library(direction);
+        continue;
+      }
+      if (touch == TouchKind::ScrollUp || touch == TouchKind::ScrollDown)
+      {
+        const int step = (touch == TouchKind::ScrollUp ? 1 : -1) * m_touch_scroll_steps;
+        if (count)
+          selection = std::clamp(
+              selection + step * (m_library_view == LibraryView::Recent ? 1 : GridColumns()), 0,
+              count - 1);
+        m_library_header_focused = false;
         pin_first_library_page = false;
-        selection = GridPage(selection, touch == TouchKind::SwipeLeft ? 1 : -1);
         continue;
       }
       if (touch == TouchKind::Tap)
       {
-        // Footer taps are dispatched by FeedTouch as synthetic controller presses.
+        pin_first_library_page = false;
+        const int header = LibraryHeaderHit(touch_x, touch_y);
+        if (header >= 0)
+        {
+          activate_header(header);
+          continue;
+        }
+        const SDL_Point point{touch_x, touch_y};
+        const SDL_Rect empty_action = LibraryEmptyActionRect();
+        if (!count && SDL_PointInRect(&point, &empty_action))
+        {
+          activate_empty();
+          continue;
+        }
         const int hit = GridHitTest(
-            touch_x, touch_y,
-            m_visible_games.empty() ? 0 : selection / GridPageSize() * GridPageSize());
+            touch_x, touch_y, count ? selection / GridPageSize() * GridPageSize() : 0, selection);
         if (hit >= 0)
         {
-          pin_first_library_page = false;
-          if (hit == selection)
+          if (hit == selection && !m_library_header_focused)
             launch = true;
           else
             selection = hit;
+          m_library_header_focused = false;
         }
         continue;
       }
@@ -18363,86 +17961,79 @@ std::optional<LaunchRequest> Launcher::Run()
         continue;
       const int button = event.type == SDL_CONTROLLERBUTTONDOWN ? event.cbutton.button : -1;
       const SDL_Keycode key = event.type == SDL_KEYDOWN ? event.key.keysym.sym : SDLK_UNKNOWN;
-      if (button == SDL_CONTROLLER_BUTTON_DPAD_LEFT || key == SDLK_LEFT)
+      pin_first_library_page = false;
+      if (button == SDL_CONTROLLER_BUTTON_DPAD_LEFT || key == SDLK_LEFT ||
+          button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT || key == SDLK_RIGHT)
       {
-        pin_first_library_page = false;
-        selection = GridNavigate(selection, -1, 0);
-      }
-      else if (button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT || key == SDLK_RIGHT)
-      {
-        pin_first_library_page = false;
-        selection = GridNavigate(selection, 1, 0);
+        const int direction =
+            button == SDL_CONTROLLER_BUTTON_DPAD_LEFT || key == SDLK_LEFT ? -1 : 1;
+        if (m_library_header_focused)
+          m_library_header_selection = (m_library_header_selection + direction + 4) % 4;
+        else
+          selection = GridNavigate(selection, direction, 0);
       }
       else if (button == SDL_CONTROLLER_BUTTON_DPAD_UP || key == SDLK_UP)
       {
-        pin_first_library_page = false;
-        selection = GridNavigate(selection, 0, -1);
+        if (!m_library_header_focused && (!count || selection % GridPageSize() < GridColumns()))
+        {
+          m_library_header_focused = true;
+          m_library_header_selection = static_cast<int>(m_library_view);
+        }
+        else if (!m_library_header_focused)
+          selection = GridNavigate(selection, 0, -1);
       }
       else if (button == SDL_CONTROLLER_BUTTON_DPAD_DOWN || key == SDLK_DOWN)
       {
-        pin_first_library_page = false;
-        selection = GridNavigate(selection, 0, 1);
+        if (m_library_header_focused)
+          m_library_header_focused = false;
+        else
+          selection = GridNavigate(selection, 0, 1);
       }
-      else if (button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER || key == SDLK_PAGEUP)
+      else if (button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER || key == SDLK_q)
+        change_tab((static_cast<int>(m_library_view) + 2) % 3);
+      else if (button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER || key == SDLK_e)
+        change_tab((static_cast<int>(m_library_view) + 1) % 3);
+      else if (key == SDLK_PAGEUP)
+        page_library(-1);
+      else if (key == SDLK_PAGEDOWN)
+        page_library(1);
+      else if (button == BUTTON_CONFIRM || key == SDLK_RETURN)
       {
-        pin_first_library_page = false;
-        selection = GridPage(selection, -1);
+        if (m_library_header_focused)
+          activate_header(m_library_header_selection);
+        else if (count)
+          launch = true;
+        else
+          activate_empty();
       }
-      else if (button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER || key == SDLK_PAGEDOWN)
+      else if ((button == BUTTON_Y || key == SDLK_SPACE) && !m_library_header_focused && count)
       {
-        pin_first_library_page = false;
-        selection = GridPage(selection, 1);
-      }
-      else if ((button == BUTTON_CONFIRM || key == SDLK_RETURN) && !m_visible_games.empty())
-        launch = true;
-      else if ((button == SDL_CONTROLLER_BUTTON_X || key == SDLK_s) && !m_visible_games.empty())
-      {
-        pin_first_library_page = false;
-        Game* const selected_game = VisibleGame(selection);
-        if (!selected_game)
-          continue;
-        const std::string sort_selected_key = selected_game->key;
-        m_sort_mode = static_cast<SortMode>((static_cast<int>(m_sort_mode) + 1) % 3);
-        m_store.SetInt("Launcher/SortMode", static_cast<int>(m_sort_mode));
-        MarkStoreDirty();
-        SortGames();
-        selection = 0;
-        select_key(sort_selected_key);
-      }
-      else if (button == BUTTON_SETTINGS || key == SDLK_F1)
-      {
-        const std::vector<std::string> old_sources = m_sources;
-        SettingsRoot();
-        FlushPendingSaves();
-        if (!m_pending_launch && (old_sources != m_sources || m_library_refresh_requested))
-          rescan_library();
-      }
-      else if (button == SDL_CONTROLLER_BUTTON_BACK || key == SDLK_f)
-      {
-        pin_first_library_page = false;
-        const Game* selected = VisibleGame(selection);
-        const std::string keep = selected ? selected->key : std::string{};
-        LibraryFilterMenu();
-        RebuildVisibleGames();
-        selection = 0;
-        select_key(keep);
-        BeginScreenFx();
-      }
-      else if ((button == SDL_CONTROLLER_BUTTON_START || key == SDLK_SPACE) &&
-               !m_visible_games.empty())
-      {
-        pin_first_library_page = false;
+        const std::string selected_key = VisibleGame(selection)->key;
         bool rescan = false;
         PerGameMenu(VisibleGame(selection), &launch, &rescan);
         if (rescan)
           rescan_library();
+        else if (!launch && !m_pending_launch)
+        {
+          SortGames();
+          selection = VisibleIndexForKey(selected_key);
+        }
+        m_recent_position = -1;
+        BeginScreenFx();
       }
+      else if (key == SDLK_F1)
+        open_settings();
       else if (button == BUTTON_CANCEL || key == SDLK_ESCAPE)
       {
-        if (ConfirmApplicationExit())
+        if (m_library_header_focused)
+          m_library_header_focused = false;
+        else if (ConfirmApplicationExit())
           break;
       }
     }
+    selection = m_visible_games.empty() ?
+                    0 :
+                    std::clamp(selection, 0, static_cast<int>(m_visible_games.size()) - 1);
     if (!m_running)
       break;
     PollUpdateNotification();

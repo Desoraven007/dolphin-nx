@@ -249,8 +249,10 @@ bool ParseJsonString(const std::string& json, std::size_t position, std::string*
   return false;
 }
 
-std::vector<std::string> DataObjects(const std::string& json)
+std::vector<std::string> DataObjects(const std::string& json, bool* complete = nullptr)
 {
+  if (complete)
+    *complete = false;
   std::vector<std::string> objects;
   const std::size_t data = json.find("\"data\"");
   const std::size_t array = data == std::string::npos ? data : json.find('[', data + 6);
@@ -290,6 +292,8 @@ std::vector<std::string> DataObjects(const std::string& json)
     }
     else if (value == ']' && depth == 0)
     {
+      if (complete)
+        *complete = true;
       break;
     }
   }
@@ -335,8 +339,10 @@ Result StatusResult(long code)
 {
   if (code == 401 || code == 403)
     return Result::NoKey;
-  if (code < 200 || code >= 300)
+  if (code == 404)
     return Result::NotFound;
+  if (code < 200 || code >= 300)
+    return Result::Error;
   return Result::Ok;
 }
 
@@ -463,8 +469,9 @@ Result SearchGames(const std::string& api_key, const std::string& title,
   return results->empty() ? Result::NotFound : Result::Ok;
 }
 
-Result FetchArtwork(const std::string& api_key, long game_id, std::vector<Artwork>* artwork,
-                    const RequestOptions* options)
+static Result FetchArtworkKind(const std::string& api_key, long game_id, const char* kind,
+                               const char* dimensions, std::vector<Artwork>* artwork,
+                               const RequestOptions* options)
 {
   if (!artwork)
     return Result::Error;
@@ -475,9 +482,9 @@ Result FetchArtwork(const std::string& api_key, long game_id, std::vector<Artwor
     return Result::NotFound;
   char endpoint[384];
   std::snprintf(endpoint, sizeof(endpoint),
-                "https://www.steamgriddb.com/api/v2/grids/game/"
-                "%ld?dimensions=600x900&types=static&mimes=image/png,image/jpeg",
-                game_id);
+                "https://www.steamgriddb.com/api/v2/%s/game/%ld?types=static&"
+                "mimes=image/png,image/jpeg&nsfw=false&humor=false&order=score%s%s",
+                kind, game_id, *dimensions ? "&dimensions=" : "", dimensions);
   std::string response;
   long code = 0;
   const HttpResult request =
@@ -487,8 +494,14 @@ Result FetchArtwork(const std::string& api_key, long game_id, std::vector<Artwor
   const Result status = StatusResult(code);
   if (status != Result::Ok)
     return status;
+  const std::size_t success = FieldValue(response, "success"), data = FieldValue(response, "data");
+  bool complete = false;
+  const auto objects = DataObjects(response, &complete);
+  if (success == std::string::npos || response.compare(success, 4, "true") != 0 ||
+      data >= response.size() || response[data] != '[' || !complete)
+    return Result::Error;
   std::unordered_set<std::string> seen;
-  for (const std::string& object : DataObjects(response))
+  for (const std::string& object : objects)
   {
     Artwork item;
     long width = 0;
@@ -507,6 +520,21 @@ Result FetchArtwork(const std::string& api_key, long game_id, std::vector<Artwor
       break;
   }
   return artwork->empty() ? Result::NotFound : Result::Ok;
+}
+
+Result FetchArtwork(const std::string& api_key, long game_id, std::vector<Artwork>* artwork,
+                    const RequestOptions* options)
+{
+  return FetchArtworkKind(api_key, game_id, "grids", "600x900", artwork, options);
+}
+
+Result FetchBackgrounds(const std::string& api_key, long game_id, std::vector<Artwork>* artwork,
+                        const RequestOptions* options)
+{
+  const Result result = FetchArtworkKind(api_key, game_id, "heroes", "", artwork, options);
+  return result == Result::NotFound ?
+             FetchArtworkKind(api_key, game_id, "grids", "920x430,460x215", artwork, options) :
+             result;
 }
 
 Result FetchIcons(const std::string& api_key, long game_id, std::vector<Artwork>* artwork,
@@ -586,7 +614,7 @@ Result DownloadImage(const std::string& url, const std::string& output_path,
   if (IsCancelled(options))
     return Result::Cancelled;
   if (code < 200 || code >= 300 || data.size() < 64)
-    return Result::NotFound;
+    return Result::Error;
   const auto* bytes = reinterpret_cast<const unsigned char*>(data.data());
   const bool png = bytes[0] == 0x89 && bytes[1] == 'P' && bytes[2] == 'N' && bytes[3] == 'G';
   const bool jpg = bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff;

@@ -213,6 +213,7 @@ else()
 endif()
 add_dependencies(dolphin_romfs dolphin_forwarder_payload dolphin_switch_translations)
 set_property(TARGET dolphin_romfs APPEND PROPERTY DKP_ASSET_FILES
+  "${CMAKE_SOURCE_DIR}/Data/Sys/icons/settings.svg"
   ${_forwarder_assets}
   ${_switch_translation_assets}
   ${_switch_launcher_translation_assets}

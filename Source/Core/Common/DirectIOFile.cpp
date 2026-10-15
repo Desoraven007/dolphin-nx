@@ -300,6 +300,8 @@ bool DirectIOFile::OffsetRead(u64 offset, u8* out_ptr, u64 size)
 #if defined(_WIN32)
   return OverlappedTransfer<ReadFile>(m_handle, offset, out_ptr, size);
 #elif defined(__SWITCH__)
+  if (!IsOpen())
+    return false;
   ASSERT(m_switch_file_state);
   return SwitchOffsetTransfer<u8, read>(m_fd, m_switch_file_state->offset_io_mutex, offset,
                                         out_ptr, size);
@@ -313,6 +315,8 @@ bool DirectIOFile::OffsetWrite(u64 offset, const u8* in_ptr, u64 size)
 #if defined(_WIN32)
   return OverlappedTransfer<WriteFile>(m_handle, offset, in_ptr, size);
 #elif defined(__SWITCH__)
+  if (!IsOpen())
+    return false;
   ASSERT(m_switch_file_state);
   return SwitchOffsetTransfer<const u8, write>(m_fd, m_switch_file_state->offset_io_mutex, offset,
                                                in_ptr, size);

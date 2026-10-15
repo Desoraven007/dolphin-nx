@@ -232,10 +232,8 @@ const std::vector<std::unique_ptr<VideoBackendBase>>& VideoBackendBase::GetAvail
 #ifdef __APPLE__
     backends.emplace(backends.begin(), std::make_unique<Metal::VideoBackend>());
 #endif
-#ifdef HAS_DEKO3D
+#if defined(HAS_DEKO3D) || defined(DOLPHIN_SWITCH_EMBEDDED_DEKO3D)
     backends.emplace(backends.begin(), std::make_unique<Deko3D::VideoBackend>());
-#elif defined(DOLPHIN_SWITCH_EMBEDDED_DEKO3D)
-    backends.push_back(std::make_unique<Deko3D::VideoBackend>());
 #endif
 #ifndef __SWITCH__
 #ifdef HAS_OPENGL

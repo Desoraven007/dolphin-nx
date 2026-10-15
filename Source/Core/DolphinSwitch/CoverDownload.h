@@ -64,6 +64,8 @@ Result SearchGames(const std::string& api_key, const std::string& title,
                    std::vector<GameResult>* results, const RequestOptions* options = nullptr);
 Result FetchArtwork(const std::string& api_key, long game_id, std::vector<Artwork>* artwork,
                     const RequestOptions* options = nullptr);
+Result FetchBackgrounds(const std::string& api_key, long game_id, std::vector<Artwork>* artwork,
+                        const RequestOptions* options = nullptr);
 Result FetchIcons(const std::string& api_key, long game_id, std::vector<Artwork>* artwork,
                   const RequestOptions* options = nullptr);
 Result DownloadImage(const std::string& url, const std::string& output_path,

@@ -153,6 +153,7 @@ endif()
 
 if(DOLPHIN_SWITCH)
   message(STATUS "Building the standalone Nintendo Switch libnx frontend")
+  include(SwitchPGO)
 
   set(DOLPHIN_SWITCH_MESA_SDK_ROOT "" CACHE PATH
       "Extracted unified Mesa Switch SDK prefix")
@@ -926,6 +927,9 @@ if(DOLPHIN_SWITCH)
 endif()
 
 add_subdirectory(Source)
+if(DOLPHIN_SWITCH)
+  dolphin_switch_enable_pgo()
+endif()
 
 ########################################
 # Install shared data files

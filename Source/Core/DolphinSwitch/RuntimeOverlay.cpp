@@ -39,6 +39,8 @@
 #include "Core/State.h"
 #include "DolphinSwitch/FrameGeneration.h"
 #include "DolphinSwitch/GBAOverlay.h"
+#include "DolphinSwitch/ScreenLayout.h"
+#include "InputCommon/ControllerInterface/Switch/Switch.h"
 #include "VideoCommon/OnScreenUI.h"
 
 namespace DolphinSwitch::RuntimeOverlay
@@ -57,6 +59,7 @@ enum class Page
   Controllers,
   ControllerModes,
   GBA,
+  ScreenLayout,
   Alert,
 };
 
@@ -99,7 +102,7 @@ struct StateSaveMonitorRequest
 
 constexpr std::uint64_t MENU_CHORD =
     HidNpadButton_L | HidNpadButton_R | HidNpadButton_Plus;
-constexpr int MAIN_ITEM_COUNT = 13;
+constexpr int MAIN_ITEM_COUNT = 14;
 constexpr int DISC_ITEM_COUNT = 3;
 constexpr int CONTROLLER_ITEM_COUNT = 5;
 constexpr int CONTROLLER_MODE_ITEM_COUNT = 6;
@@ -190,6 +193,8 @@ void QueueAction(Action action)
 
 void SetPage(Page page)
 {
+  if (s_page == Page::ScreenLayout)
+    ScreenLayout::CancelEdit();
   s_page = page;
   s_selection = 0;
 }
@@ -662,6 +667,7 @@ int ItemCount()
   case Page::GBA:
     return 7;
   case Page::Alert:
+  case Page::ScreenLayout:
     return 1;
   }
   return 1;
@@ -781,6 +787,10 @@ void ActivateSelection()
       CloseMenu();
       break;
     case 13:
+      SetPage(Page::ScreenLayout);
+      ScreenLayout::BeginEdit(s_gba_ports);
+      break;
+    case 14:
       SetPage(Page::GBA);
       break;
     }
@@ -872,6 +882,8 @@ void ActivateSelection()
   case Page::Alert:
     CloseMenu();
     break;
+  case Page::ScreenLayout:
+    break;
   case Page::GBA:
     if (s_selection < 2)
       ChangeGBASetting(1);
@@ -949,8 +961,9 @@ void RenderMainPage()
                 10);
   SelectableRow("Reset console", 11);
   SelectableRow("Return to Dolphin launcher", 12);
+  SelectableRow("Screen layout                                   >", 13);
   if (HasGBA())
-    SelectableRow("Game Boy Advance                                >", 13);
+    SelectableRow("Game Boy Advance                                >", 14);
 }
 
 void RenderGBAPage()
@@ -1176,6 +1189,7 @@ void BeginSession(std::string game_path, std::string game_id, unsigned revision,
     s_game_id = SConfig::GetInstance().GetGameID();
     s_revision = SConfig::GetInstance().GetRevision();
   }
+  ScreenLayout::BeginSession(s_game_id, s_revision);
   s_visible.store(false, std::memory_order_release);
   s_capture_until_release.store(false, std::memory_order_release);
   s_render_frame_generation.store(0, std::memory_order_release);
@@ -1207,6 +1221,7 @@ void BeginSession(std::string game_path, std::string game_id, unsigned revision,
 
 void EndSession()
 {
+  ScreenLayout::EndSession();
   InvalidateBrowserScan();
   InvalidateStateSaveMonitor();
   std::lock_guard lock{s_mutex};
@@ -1234,7 +1249,7 @@ void UpdateInput(std::uint64_t down, std::uint64_t held, bool gamecube_adapter)
 
   if (s_capture_until_release.load(std::memory_order_relaxed))
   {
-    if (held != 0)
+    if (held != 0 || ciface::Switch::GetTouchscreenState().pressed)
       return;
     s_capture_until_release.store(false, std::memory_order_release);
   }
@@ -1252,6 +1267,14 @@ void UpdateInput(std::uint64_t down, std::uint64_t held, bool gamecube_adapter)
 
   if (!s_visible.load(std::memory_order_acquire))
     return;
+  if (s_page == Page::ScreenLayout)
+  {
+    if (down & HidNpadButton_B)
+      SetPage(Page::Main);
+    else if (ScreenLayout::UpdateEditor(down, held))
+      SetPage(Page::Main);
+    return;
+  }
   const int count = std::max(1, ItemCount());
   if (down & HidNpadButton_Up)
   {
@@ -1476,6 +1499,11 @@ void Draw()
   std::lock_guard lock{s_mutex};
   if (!s_initialized || !s_visible.load(std::memory_order_relaxed))
     return;
+  if (s_page == Page::ScreenLayout)
+  {
+    ScreenLayout::DrawEditor();
+    return;
+  }
   if (s_page == Page::Achievements &&
       std::chrono::steady_clock::now() >= s_achievement_refresh_at)
   {
@@ -1539,6 +1567,7 @@ void Draw()
       CenteredText("Game Boy Advance");
       break;
     case Page::Alert:
+    case Page::ScreenLayout:
       break;
     }
     ImGui::Separator();
@@ -1579,6 +1608,8 @@ void Draw()
       break;
     case Page::Alert:
       RenderAlert();
+      break;
+    case Page::ScreenLayout:
       break;
     }
 

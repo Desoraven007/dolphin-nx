@@ -103,6 +103,10 @@ const Info<bool> GFX_BACKEND_MULTITHREADING{{System::GFX, "Settings", "BackendMu
                                             true};
 const Info<bool> GFX_SWITCH_GLTHREAD{{System::GFX, "Settings", "SwitchGLThread"}, false};
 const Info<bool> GFX_SWITCH_USE_ZINK{{System::GFX, "Settings", "SwitchUseZink"}, false};
+#ifdef __SWITCH__
+const Info<std::string> GFX_SWITCH_SCREEN_LAYOUT{{System::GFX, "Settings", "SwitchScreenLayout"},
+                                                 ""};
+#endif
 const Info<int> GFX_COMMAND_BUFFER_EXECUTE_INTERVAL{
     {System::GFX, "Settings", "CommandBufferExecuteInterval"}, 100};
 

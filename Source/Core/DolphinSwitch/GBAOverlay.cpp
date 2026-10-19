@@ -18,6 +18,7 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/HW/GBACore.h"
 #include "Core/Host.h"
+#include "DolphinSwitch/ScreenLayout.h"
 #include "VideoCommon/AbstractGfx.h"
 #include "VideoCommon/AbstractTexture.h"
 #include "VideoCommon/TextureConfig.h"
@@ -192,8 +193,9 @@ void Draw()
   float column_x = margin;
   float offset = margin;
   float column_width = 0.0f;
-  for (AbstractTexture* texture : textures)
+  for (size_t port = 0; port < SLOT_COUNT; ++port)
   {
+    AbstractTexture* texture = textures[port];
     if (!texture)
       continue;
 
@@ -208,7 +210,10 @@ void Draw()
 
     const float x = left ? column_x : display.x - column_x - width;
     const float y = bottom ? display.y - offset - height : offset;
-    draw->AddImage(*texture, ImVec2(x, y), ImVec2(x + width, y + height));
+    const auto rectangle =
+        ScreenLayout::ApplyGBA(port, {x, y, x + width, y + height}, display.x, display.y);
+    draw->AddImage(*texture, ImVec2(rectangle.left, rectangle.top),
+                   ImVec2(rectangle.right, rectangle.bottom));
     offset += height + margin;
     column_width = std::max(column_width, width);
   }

@@ -17,6 +17,9 @@
 #include "VideoCommon/AbstractGfx.h"
 #include "VideoCommon/FrameDumper.h"
 #include "VideoCommon/FrameGeneration.h"
+#ifdef __SWITCH__
+#include "DolphinSwitch/ScreenLayout.h"
+#endif
 #ifdef HAS_DEKO3D
 #include "DolphinSwitch/FrameGeneration.h"
 #endif
@@ -817,6 +820,10 @@ void Presenter::UpdateDrawRectangle()
   m_target_rectangle.top = static_cast<int>(std::round(win_height / 2.0 - int_draw_height / 2.0));
   m_target_rectangle.right = m_target_rectangle.left + int_draw_width;
   m_target_rectangle.bottom = m_target_rectangle.top + int_draw_height;
+#ifdef __SWITCH__
+  m_target_rectangle = DolphinSwitch::ScreenLayout::ApplyMain(
+      m_target_rectangle, m_backbuffer_width, m_backbuffer_height);
+#endif
 }
 
 std::tuple<float, float> Presenter::ScaleToDisplayAspectRatio(const int width, const int height,

@@ -27,6 +27,8 @@ add_executable(dolphin-switch
   Main.cpp
   RuntimeOverlay.cpp
   RuntimeOverlay.h
+  ScreenLayout.cpp
+  ScreenLayout.h
   SwitchPosixCompat.cpp
   Storage.cpp
   Storage.h

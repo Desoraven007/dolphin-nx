@@ -5,4 +5,3 @@ set(PUGIXML_BUILD_DEFINES "")
 set(PUGIXML_INSTALL OFF)
 
 add_subdirectory(pugixml)
-dolphin_disable_warnings(pugixml-static)

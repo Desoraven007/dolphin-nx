@@ -102,7 +102,7 @@ struct StateSaveMonitorRequest
 
 constexpr std::uint64_t MENU_CHORD =
     HidNpadButton_L | HidNpadButton_R | HidNpadButton_Plus;
-constexpr int MAIN_ITEM_COUNT = 14;
+constexpr int MAIN_ITEM_COUNT = 13;
 constexpr int DISC_ITEM_COUNT = 3;
 constexpr int CONTROLLER_ITEM_COUNT = 5;
 constexpr int CONTROLLER_MODE_ITEM_COUNT = 6;
@@ -112,7 +112,6 @@ std::atomic_bool s_visible{false};
 std::atomic_bool s_capture_until_release{false};
 std::atomic<std::uint64_t> s_render_frame_generation{0};
 bool s_initialized = false;
-bool s_user_paused = false;
 bool s_show_fps = false;
 bool s_vbi_skip = false;
 bool s_is_wii = false;
@@ -679,9 +678,9 @@ bool ItemAvailable(int index)
     return s_gba_ports[index - 2];
   if (s_page != Page::Main)
     return true;
-  if (index == 3 && IsHardcoreActive())
+  if (index == 2 && IsHardcoreActive())
     return false;
-  if (index == 7 && !s_is_wii)
+  if (index == 6 && !s_is_wii)
     return false;
   return index != 8 || DolphinSwitch::FrameGeneration::IsAvailable();
 }
@@ -747,27 +746,28 @@ void ActivateSelection()
       CloseMenu();
       break;
     case 1:
-      QueueAction({ActionType::TogglePause});
-      break;
-    case 2:
       SetPage(Page::SaveStates);
       break;
-    case 3:
+    case 2:
       SetPage(Page::LoadStates);
       break;
-    case 4:
+    case 3:
       SetPage(Page::Disc);
       break;
-    case 5:
+    case 4:
       SetPage(Page::Cheats);
       break;
-    case 6:
+    case 5:
       SetPage(Page::Achievements);
       RefreshAchievements();
       break;
-    case 7:
+    case 6:
       if (s_is_wii)
         SetPage(Page::Controllers);
+      break;
+    case 7:
+      SetPage(Page::ScreenLayout);
+      ScreenLayout::BeginEdit(s_gba_ports);
       break;
     case 8:
       QueueAction({ActionType::ToggleFrameGeneration});
@@ -787,10 +787,6 @@ void ActivateSelection()
       CloseMenu();
       break;
     case 13:
-      SetPage(Page::ScreenLayout);
-      ScreenLayout::BeginEdit(s_gba_ports);
-      break;
-    case 14:
       SetPage(Page::GBA);
       break;
     }
@@ -919,26 +915,21 @@ void RenderMainPage()
 {
   const bool hardcore = IsHardcoreActive();
   SelectableRow("Resume game", 0);
-  SelectableRow(s_user_paused ? "Resume emulation" : "Pause emulation", 1);
-  SelectableRow("Save state                                      >", 2);
+  SelectableRow("Save state                                      >", 1);
   if (hardcore)
     ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(120, 145, 158, 255));
   SelectableRow(hardcore ? "Load state                         Hardcore disabled" :
                            "Load state                                      >",
-                3);
+                2);
   if (hardcore)
     ImGui::PopStyleColor();
-  SelectableRow("Disc management                                 >", 4);
-  SelectableRow("Cheats                                          >", 5);
+  SelectableRow("Disc management                                 >", 3);
+  SelectableRow("Cheats                                          >", 4);
   SelectableRow(std::string("RetroAchievements                 ") + AchievementStatus() + "  >",
-                6);
-  if (!s_is_wii)
-    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(120, 145, 158, 255));
-  SelectableRow(s_is_wii ? "Controller modes                                >" :
-                           "Controller modes                  Wii games only",
-                7);
-  if (!s_is_wii)
-    ImGui::PopStyleColor();
+                5);
+  if (s_is_wii)
+    SelectableRow("Controller modes                                >", 6);
+  SelectableRow("Screen layout                                   >", 7);
   if (!DolphinSwitch::FrameGeneration::IsAvailable())
     ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(120, 145, 158, 255));
   SelectableRow(std::string("Frame Generation                 <  ") +
@@ -961,9 +952,8 @@ void RenderMainPage()
                 10);
   SelectableRow("Reset console", 11);
   SelectableRow("Return to Dolphin launcher", 12);
-  SelectableRow("Screen layout                                   >", 13);
   if (HasGBA())
-    SelectableRow("Game Boy Advance                                >", 14);
+    SelectableRow("Game Boy Advance                                >", 13);
 }
 
 void RenderGBAPage()
@@ -1196,7 +1186,6 @@ void BeginSession(std::string game_path, std::string game_id, unsigned revision,
   s_page = Page::Main;
   s_selection = 0;
   s_actions.clear();
-  s_user_paused = false;
   s_show_fps = Config::Get(Config::GFX_SHOW_FPS);
   s_vbi_skip = Config::Get(Config::GFX_HACK_VI_SKIP);
   s_is_wii = is_wii;
@@ -1327,12 +1316,6 @@ bool IsInputCaptured()
 std::uint64_t GetRenderFrameGeneration()
 {
   return s_render_frame_generation.load(std::memory_order_acquire);
-}
-
-void SetUserPaused(bool paused)
-{
-  std::lock_guard lock{s_mutex};
-  s_user_paused = paused;
 }
 
 void SetStatus(std::string message)

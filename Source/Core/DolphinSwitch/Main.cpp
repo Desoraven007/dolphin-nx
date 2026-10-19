@@ -1066,7 +1066,6 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request,
     {
       // The overlay needs presented frames while a paused title is open.
       user_paused = true;
-      DolphinSwitch::RuntimeOverlay::SetUserPaused(true);
       Core::SetState(system, Core::State::Running);
     }
 
@@ -1076,28 +1075,6 @@ SessionResult RunGameSession(const DolphinSwitch::LaunchRequest& request,
     {
       switch (action.type)
       {
-      case DolphinSwitch::RuntimeOverlay::ActionType::TogglePause:
-        if (!user_paused && AchievementManager::GetInstance().GetClient() &&
-            AchievementManager::GetInstance().IsHardcoreModeActive() &&
-            !AchievementManager::GetInstance().CanPause())
-        {
-          DolphinSwitch::RuntimeOverlay::SetStatus("Hardcore mode cannot pause yet");
-          break;
-        }
-        user_paused = !user_paused;
-        DolphinSwitch::RuntimeOverlay::SetUserPaused(user_paused);
-        if (s_host_focused.load(std::memory_order_acquire))
-        {
-          // Apply pause after the overlay's final frame is replaced.
-          Core::SetState(system, overlay_visible ?
-                                     Core::State::Running :
-                                     (user_paused ? Core::State::Paused : Core::State::Running));
-        }
-        if (!user_paused)
-          pause_after_render_generation.reset();
-        DolphinSwitch::RuntimeOverlay::SetStatus(
-            user_paused ? "Pause armed - close the quick menu to pause" : "Emulation resumed");
-        break;
       case DolphinSwitch::RuntimeOverlay::ActionType::StopToLauncher:
         stop_to_launcher = true;
         s_session_running.store(false, std::memory_order_release);

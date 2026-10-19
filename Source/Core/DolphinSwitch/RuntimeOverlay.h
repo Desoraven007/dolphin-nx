@@ -21,7 +21,6 @@ enum class ControllerMode
 
 enum class ActionType
 {
-  TogglePause,
   StopToLauncher,
   SaveState,
   LoadState,
@@ -59,7 +58,6 @@ bool IsVisible();
 bool IsInputCaptured();
 std::uint64_t GetRenderFrameGeneration();
 
-void SetUserPaused(bool paused);
 void SetStatus(std::string message);
 void ShowAlert(std::string caption, std::string message);
 void TrackStateSave(int slot, std::uint64_t previous_timestamp);

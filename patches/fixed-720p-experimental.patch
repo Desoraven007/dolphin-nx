@@ -1,0 +1,30 @@
+--- a/Source/Core/VideoCommon/FramebufferManager.cpp
++++ b/Source/Core/VideoCommon/FramebufferManager.cpp
+@@ -192,12 +192,12 @@
+ 
+ int FramebufferManager::EFBToScaledX(int x) const
+ {
+-  return x * static_cast<int>(m_efb_scale);
++  return static_cast<int>(x * (static_cast<float>(GetEFBWidth()) / EFB_WIDTH));
+ }
+ 
+ int FramebufferManager::EFBToScaledY(int y) const
+ {
+-  return y * static_cast<int>(m_efb_scale);
++  return static_cast<int>(y * (static_cast<float>(GetEFBHeight()) / EFB_HEIGHT));
+ }
+ 
+ float FramebufferManager::EFBToScaledXf(float x) const
+@@ -221,8 +221,10 @@
+   if (max_size < EFB_WIDTH * m_efb_scale)
+     m_efb_scale = max_size / EFB_WIDTH;
+ 
+-  u32 new_efb_width = std::max(EFB_WIDTH * static_cast<int>(m_efb_scale), 1u);
+-  u32 new_efb_height = std::max(EFB_HEIGHT * static_cast<int>(m_efb_scale), 1u);
++  // Experimental fixed 720p EFB for Dolphin-NX.
++  // WARNING: other rendering paths may still assume isotropic integer EFB scaling.
++  u32 new_efb_width = std::min(1280u, max_size);
++  u32 new_efb_height = std::min(720u, max_size);
+ 
+   return std::make_tuple(new_efb_width, new_efb_height);
+ }

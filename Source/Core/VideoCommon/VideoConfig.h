@@ -18,6 +18,8 @@
 #include "VideoCommon/VideoCommon.h"
 
 constexpr int EFB_SCALE_AUTO_INTEGRAL = 0;
+constexpr int EFB_SCALE_SWITCH_HANDHELD = 20;
+constexpr int EFB_SCALE_SWITCH_DOCKED = 21;
 
 enum class AspectMode : int
 {

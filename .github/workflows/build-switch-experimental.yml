@@ -1,0 +1,42 @@
+name: Experimental Dolphin-NX Switch NRO
+
+on:
+  push:
+    branches:
+      - experimental/fixed-720p
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+    env:
+      DEVKITPRO: /opt/devkitpro
+      DEVKITA64: /opt/devkitpro/devkitA64
+      DOLPHIN_SWITCH_JOBS: "2"
+      DOLPHIN_SWITCH_MESA_SDK_URL: ${{ secrets.MESA_SWITCH_SDK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install host build dependencies
+        run: |
+          apt-get update
+          apt-get install -y cmake ninja-build curl unzip zip python3 pkg-config
+      - name: Check Mesa Switch SDK configuration
+        run: |
+          if [ -z "$DOLPHIN_SWITCH_MESA_SDK_URL" ]; then
+            echo "::error::Configure repository secret MESA_SWITCH_SDK_URL with a downloadable Mesa Switch unified SDK ZIP URL."
+            exit 1
+          fi
+      - name: Download Mesa Switch SDK
+        run: curl --fail --location --retry 3 "$DOLPHIN_SWITCH_MESA_SDK_URL" -o /tmp/mesa-switch-unified-sdk.zip
+      - name: Build Dolphin NRO
+        run: bash Tools/Switch/build.sh /tmp/mesa-switch-unified-sdk.zip
+      - name: Upload NRO
+        uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-nx-switch-experimental
+          path: build-switch/Binaries/dolphin.nro
+          if-no-files-found: error

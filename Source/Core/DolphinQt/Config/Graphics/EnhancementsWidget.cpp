@@ -84,7 +84,7 @@ void EnhancementsWidget::CreateWidgets()
   // when the settings are saved we don't lose the user-modified value from the ini.
   const int max_efb_scale = std::max(Get(m_game_layer, Config::GFX_EFB_SCALE),
                                      Get(m_game_layer, Config::GFX_MAX_EFB_SCALE));
-  for (int scale = static_cast<int>(resolution_options.size()); scale <= max_efb_scale; scale++)
+  for (int scale = static_cast<int>(resolution_options.size()); scale <= std::max(max_efb_scale, EFB_SCALE_SWITCH_DOCKED); scale++)
   {
     const QString scale_text = QString::number(scale);
     const QString width_text = QString::number(static_cast<int>(EFB_WIDTH) * scale);
@@ -93,7 +93,15 @@ void EnhancementsWidget::CreateWidgets()
     const QString extra_text = resolution_extra_options.size() > extra_index ?
                                    resolution_extra_options[extra_index] :
                                    QStringLiteral("");
-    if (extra_text.isEmpty())
+    if (scale == EFB_SCALE_SWITCH_HANDHELD)
+    {
+      resolution_options.append(tr("Switch Handheld - 720p (1280x720)"));
+    }
+    else if (scale == EFB_SCALE_SWITCH_DOCKED)
+    {
+      resolution_options.append(tr("Switch Dock - 1080p (1920x1080)"));
+    }
+    else if (extra_text.isEmpty())
     {
       resolution_options.append(tr("%1x Native (%2x%3)").arg(scale_text, width_text, height_text));
     }

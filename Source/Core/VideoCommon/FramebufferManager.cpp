@@ -212,6 +212,17 @@ float FramebufferManager::EFBToScaledYf(float y) const
 
 std::tuple<u32, u32> FramebufferManager::CalculateTargetSize(int efb_scale)
 {
+  // Experimental Nintendo Switch output-resolution presets.
+  // Other rendering paths may assume a uniform EFB scale.
+  if (efb_scale == EFB_SCALE_SWITCH_HANDHELD || efb_scale == EFB_SCALE_SWITCH_DOCKED)
+  {
+    m_efb_scale = efb_scale == EFB_SCALE_SWITCH_HANDHELD ? 2 : 3;
+    const u32 max_size = g_backend_info.MaxTextureSize;
+    const u32 width = efb_scale == EFB_SCALE_SWITCH_HANDHELD ? 1280u : 1920u;
+    const u32 height = efb_scale == EFB_SCALE_SWITCH_HANDHELD ? 720u : 1080u;
+    return {std::min(width, max_size), std::min(height, max_size)};
+  }
+
   if (efb_scale == EFB_SCALE_AUTO_INTEGRAL)
     m_efb_scale = g_presenter->AutoIntegralScale();
   else
